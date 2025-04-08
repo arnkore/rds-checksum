@@ -18,10 +18,6 @@ func TestMain(m *testing.M) {
 	fmt.Println("2. TestCompareChecksums (2 cases)")
 	fmt.Println("   - Matching checksums")
 	fmt.Println("   - Different checksums")
-	fmt.Println("3. TestConfigValidation (3 cases)")
-	fmt.Println("   - Valid config")
-	fmt.Println("   - Missing host")
-	fmt.Println("   - Missing user")
 	fmt.Println("Initializing test database...")
 	
 	// 初始化测试数据库
@@ -127,55 +123,6 @@ func TestCompareChecksums(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := CompareChecksums(tt.checksum1, tt.checksum2); got != tt.expected {
 				t.Errorf("CompareChecksums() = %v, want %v", got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestConfigValidation(t *testing.T) {
-	tests := []struct {
-		name    string
-		config  *Config
-		wantErr bool
-	}{
-		{
-			name: "Valid config",
-			config: &Config{
-				Host:     "localhost",
-				Port:     3306,
-				User:     "root",
-				Password: "Model_123",
-				Database: "test",
-			},
-			wantErr: false,
-		},
-		{
-			name: "Missing host",
-			config: &Config{
-				Port:     3306,
-				User:     "root",
-				Password: "Model_123",
-				Database: "test",
-			},
-			wantErr: true,
-		},
-		{
-			name: "Missing user",
-			config: &Config{
-				Host:     "localhost",
-				Port:     3306,
-				Password: "Model_123",
-				Database: "test",
-			},
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validateConfig(tt.config)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("validateConfig() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}

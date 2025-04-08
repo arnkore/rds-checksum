@@ -17,29 +17,8 @@ type Config struct {
 	Database string
 }
 
-// validateConfig checks if the configuration is valid
-func validateConfig(config *Config) error {
-	if config.Host == "" {
-		return fmt.Errorf("host is required")
-	}
-	if config.User == "" {
-		return fmt.Errorf("user is required")
-	}
-	if config.Database == "" {
-		return fmt.Errorf("database is required")
-	}
-	if config.Port <= 0 {
-		return fmt.Errorf("port must be positive")
-	}
-	return nil
-}
-
 // CalculateChecksum calculates the checksum for a given table
 func CalculateChecksum(config *Config, table string) (string, error) {
-	if err := validateConfig(config); err != nil {
-		return "", err
-	}
-
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", config.User, config.Password, config.Host, config.Port, config.Database)
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
