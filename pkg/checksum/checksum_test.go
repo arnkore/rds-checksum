@@ -12,9 +12,10 @@ import (
 func TestMain(m *testing.M) {
 	// 打印测试信息
 	fmt.Println("Running tests for package checksum:")
-	fmt.Println("1. TestCalculateChecksum (2 cases)")
+	fmt.Println("1. TestCalculateChecksum (3 cases)")
 	fmt.Println("   - Valid table")
 	fmt.Println("   - Non-existent table")
+	fmt.Println("   - Large table with multiple batches")
 	fmt.Println("2. TestCompareChecksums (2 cases)")
 	fmt.Println("   - Matching checksums")
 	fmt.Println("   - Different checksums")
@@ -56,6 +57,14 @@ func initTestDB() {
 }
 
 func TestCalculateChecksum(t *testing.T) {
+	config := &Config{
+		Host:     "localhost",
+		Port:     3306,
+		User:     "root",
+		Password: "Model_123",
+		Database: "test",
+	}
+
 	tests := []struct {
 		name     string
 		table    string
@@ -74,14 +83,12 @@ func TestCalculateChecksum(t *testing.T) {
 			expected: "",
 			wantErr:  true,
 		},
-	}
-
-	config := &Config{
-		Host:     "localhost",
-		Port:     3306,
-		User:     "root",
-		Password: "Model_123",
-		Database: "test",
+		{
+			name:     "Large table with multiple batches",
+			table:    "test_table",
+			expected: "",
+			wantErr:  false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -93,6 +100,14 @@ func TestCalculateChecksum(t *testing.T) {
 			}
 			if !tt.wantErr && got == "" {
 				t.Error("CalculateChecksum() returned empty checksum for valid table")
+			}
+			if !tt.wantErr {
+				// Verify the checksum format
+				var count, sum int64
+				_, err := fmt.Sscanf(got, "%d-%d", &count, &sum)
+				if err != nil {
+					t.Errorf("Invalid checksum format: %s", got)
+				}
 			}
 		})
 	}
@@ -107,14 +122,14 @@ func TestCompareChecksums(t *testing.T) {
 	}{
 		{
 			name:     "Matching checksums",
-			checksum1: "123456",
-			checksum2: "123456",
+			checksum1: "123456-789012",
+			checksum2: "123456-789012",
 			expected: true,
 		},
 		{
 			name:     "Different checksums",
-			checksum1: "123456",
-			checksum2: "654321",
+			checksum1: "123456-789012",
+			checksum2: "654321-210987",
 			expected: false,
 		},
 	}
