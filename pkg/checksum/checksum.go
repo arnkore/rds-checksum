@@ -102,11 +102,21 @@ func (bp *batchProcessor) processBatch(batchNum int64) batchResult {
 	}
 	defer batchDB.Close()
 
-	offset := batchNum * bp.batchSize
-	query := fmt.Sprintf("SELECT id, %s FROM %s ORDER BY id LIMIT %d OFFSET %d",
-		strings.Join(bp.info.Columns, ", "), bp.info.Name, bp.batchSize, offset)
+	// Calculate the primary key range for this batch
+	startPK := bp.info.MinPK + (batchNum * bp.batchSize)
+	endPK := startPK + bp.batchSize - 1
+	if endPK > bp.info.MaxPK {
+		endPK = bp.info.MaxPK
+	}
 
-	rows, err := batchDB.Query(query)
+	query := fmt.Sprintf("SELECT %s, %s FROM %s WHERE %s BETWEEN ? AND ? ORDER BY %s",
+		bp.info.PKColumn,
+		strings.Join(bp.info.Columns, ", "),
+		bp.info.Name,
+		bp.info.PKColumn,
+		bp.info.PKColumn)
+
+	rows, err := batchDB.Query(query, startPK, endPK)
 	if err != nil {
 		return batchResult{
 			batchNum: int(batchNum),
@@ -125,7 +135,7 @@ func (bp *batchProcessor) processRows(rows *sql.Rows, batchNum int64) batchResul
 	var failedRowIDs []int64
 
 	for rows.Next() {
-		values := make([]interface{}, len(bp.info.Columns)+1) // +1 for id
+		values := make([]interface{}, len(bp.info.Columns)+1) // +1 for primary key
 		valuePtrs := make([]interface{}, len(bp.info.Columns)+1)
 		for i := range values {
 			valuePtrs[i] = &values[i]
@@ -201,8 +211,9 @@ func CalculateChecksum(config *Config, tableName string, mode Mode) (*Validation
 	// Create batch processor
 	processor := newBatchProcessor(connector, info, mode)
 
-	// Calculate number of batches
-	numBatches := (info.RowCount + processor.batchSize - 1) / processor.batchSize
+	// Calculate number of batches based on primary key range
+	totalRange := info.MaxPK - info.MinPK + 1
+	numBatches := (totalRange + processor.batchSize - 1) / processor.batchSize
 
 	// Process batches
 	results := make([]batchResult, numBatches)

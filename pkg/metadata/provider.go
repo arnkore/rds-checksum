@@ -10,6 +10,9 @@ type TableInfo struct {
 	Name     string
 	Columns  []string
 	RowCount int64
+	PKColumn string
+	MinPK    int64
+	MaxPK    int64
 }
 
 // TableMetaProvider handles fetching table metadata
@@ -89,6 +92,32 @@ func (p *TableMetaProvider) getTableColumns(tableName string) ([]string, error) 
 	return columns, nil
 }
 
+// getPrimaryKeyInfo retrieves primary key column and its min/max values
+func (p *TableMetaProvider) getPrimaryKeyInfo(tableName string) (string, int64, int64, error) {
+	// Get primary key column name
+	var pkColumn string
+	err := p.db.QueryRow(`
+		SELECT column_name 
+		FROM information_schema.columns 
+		WHERE table_schema = ? 
+		AND table_name = ? 
+		AND column_key = 'PRI'`,
+		p.config.Database, tableName).Scan(&pkColumn)
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("failed to get primary key column: %v", err)
+	}
+
+	// Get min and max primary key values
+	var minPK, maxPK int64
+	err = p.db.QueryRow(fmt.Sprintf("SELECT MIN(%s), MAX(%s) FROM %s", pkColumn, pkColumn, tableName)).
+		Scan(&minPK, &maxPK)
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("failed to get primary key range: %v", err)
+	}
+
+	return pkColumn, minPK, maxPK, nil
+}
+
 // GetTableInfo retrieves table information by coordinating multiple operations
 func (p *TableMetaProvider) GetTableInfo(tableName string) (*TableInfo, error) {
 	// First verify table exists
@@ -108,9 +137,18 @@ func (p *TableMetaProvider) GetTableInfo(tableName string) (*TableInfo, error) {
 		return nil, err
 	}
 
+	// Get primary key information
+	pkColumn, minPK, maxPK, err := p.getPrimaryKeyInfo(tableName)
+	if err != nil {
+		return nil, err
+	}
+
 	return &TableInfo{
 		Name:     tableName,
 		Columns:  columns,
 		RowCount: rowCount,
+		PKColumn: pkColumn,
+		MinPK:    minPK,
+		MaxPK:    maxPK,
 	}, nil
 } 
