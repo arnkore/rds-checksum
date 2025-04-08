@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"crypto/md5"
 
 	_ "github.com/go-sql-driver/mysql"
-	"crypto/md5"
+	"github.com/liuzonghao/mychecksum/pkg/checksum/metadata"
 )
 
 // Config holds the MySQL connection configuration
@@ -71,117 +72,16 @@ func (dc *dbConnector) connect() (*sql.DB, error) {
 	return db, nil
 }
 
-// tableInfo holds information about a database table
-type tableInfo struct {
-	name     string
-	columns  []string
-	rowCount int64
-}
-
-// TableMetaProvider handles fetching table metadata
-type TableMetaProvider struct {
-	db     *sql.DB
-	config *Config
-}
-
-// newTableMetaProvider creates a new TableMetaProvider
-func newTableMetaProvider(db *sql.DB, config *Config) *TableMetaProvider {
-	return &TableMetaProvider{
-		db:     db,
-		config: config,
-	}
-}
-
-// verifyTableExists checks if the specified table exists in the database
-func (p *TableMetaProvider) verifyTableExists(tableName string) error {
-	var count int
-	err := p.db.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
-		p.config.Database, tableName).Scan(&count)
-	if err != nil {
-		return fmt.Errorf("failed to check table existence: %v", err)
-	}
-	if count == 0 {
-		return fmt.Errorf("table %s does not exist", tableName)
-	}
-	return nil
-}
-
-// getTableRowCount retrieves the total number of rows in the table
-func (p *TableMetaProvider) getTableRowCount(tableName string) (int64, error) {
-	var totalRows int64
-	err := p.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)).Scan(&totalRows)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get total row count: %v", err)
-	}
-	return totalRows, nil
-}
-
-// getTableColumns retrieves all column names for the table
-func (p *TableMetaProvider) getTableColumns(tableName string) ([]string, error) {
-	rows, err := p.db.Query(`
-		SELECT column_name 
-		FROM information_schema.columns 
-		WHERE table_schema = ? 
-		AND table_name = ? 
-		ORDER BY ordinal_position`,
-		p.config.Database, tableName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get columns: %v", err)
-	}
-	defer rows.Close()
-
-	var columns []string
-	for rows.Next() {
-		var column string
-		if err := rows.Scan(&column); err != nil {
-			return nil, fmt.Errorf("failed to scan column: %v", err)
-		}
-		columns = append(columns, column)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating columns: %v", err)
-	}
-
-	return columns, nil
-}
-
-// getTableInfo retrieves table information by coordinating multiple operations
-func (p *TableMetaProvider) getTableInfo(tableName string) (*tableInfo, error) {
-	// First verify table exists
-	if err := p.verifyTableExists(tableName); err != nil {
-		return nil, err
-	}
-
-	// Get row count
-	rowCount, err := p.getTableRowCount(tableName)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get columns
-	columns, err := p.getTableColumns(tableName)
-	if err != nil {
-		return nil, err
-	}
-
-	return &tableInfo{
-		name:     tableName,
-		columns:  columns,
-		rowCount: rowCount,
-	}, nil
-}
-
 // batchProcessor handles the processing of data in batches
 type batchProcessor struct {
 	connector *dbConnector
-	info      *tableInfo
+	info      *metadata.TableInfo
 	mode      Mode
 	batchSize int64
 }
 
 // newBatchProcessor creates a new batch processor
-func newBatchProcessor(connector *dbConnector, info *tableInfo, mode Mode) *batchProcessor {
+func newBatchProcessor(connector *dbConnector, info *metadata.TableInfo, mode Mode) *batchProcessor {
 	return &batchProcessor{
 		connector: connector,
 		info:      info,
@@ -204,7 +104,7 @@ func (bp *batchProcessor) processBatch(batchNum int64) batchResult {
 
 	offset := batchNum * bp.batchSize
 	query := fmt.Sprintf("SELECT id, %s FROM %s ORDER BY id LIMIT %d OFFSET %d",
-		strings.Join(bp.info.columns, ", "), bp.info.name, bp.batchSize, offset)
+		strings.Join(bp.info.Columns, ", "), bp.info.Name, bp.batchSize, offset)
 
 	rows, err := batchDB.Query(query)
 	if err != nil {
@@ -225,8 +125,8 @@ func (bp *batchProcessor) processRows(rows *sql.Rows, batchNum int64) batchResul
 	var failedRowIDs []int64
 
 	for rows.Next() {
-		values := make([]interface{}, len(bp.info.columns)+1) // +1 for id
-		valuePtrs := make([]interface{}, len(bp.info.columns)+1)
+		values := make([]interface{}, len(bp.info.Columns)+1) // +1 for id
+		valuePtrs := make([]interface{}, len(bp.info.Columns)+1)
 		for i := range values {
 			valuePtrs[i] = &values[i]
 		}
@@ -267,7 +167,7 @@ func (bp *batchProcessor) processRows(rows *sql.Rows, batchNum int64) batchResul
 		count:        batchCount,
 		checksum:     batchChecksum,
 		err:          nil,
-		FailedRowIDs: failedRowIDs,
+		FailedRowIDs: make([]int64, 0),
 	}
 }
 
@@ -284,10 +184,16 @@ func CalculateChecksum(config *Config, tableName string, mode Mode) (*Validation
 	defer db.Close()
 
 	// Create TableMetaProvider
-	metaProvider := newTableMetaProvider(db, config)
+	metaProvider := metadata.NewTableMetaProvider(db, &metadata.Config{
+		Host:     config.Host,
+		Port:     config.Port,
+		User:     config.User,
+		Password: config.Password,
+		Database: config.Database,
+	})
 
 	// Get table information
-	info, err := metaProvider.getTableInfo(tableName)
+	info, err := metaProvider.GetTableInfo(tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -296,7 +202,7 @@ func CalculateChecksum(config *Config, tableName string, mode Mode) (*Validation
 	processor := newBatchProcessor(connector, info, mode)
 
 	// Calculate number of batches
-	numBatches := (info.rowCount + processor.batchSize - 1) / processor.batchSize
+	numBatches := (info.RowCount + processor.batchSize - 1) / processor.batchSize
 
 	// Process batches
 	results := make([]batchResult, numBatches)
