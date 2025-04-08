@@ -66,47 +66,58 @@ func TestCalculateChecksum(t *testing.T) {
 	}
 
 	tests := []struct {
-		name     string
-		table    string
-		expected string
-		wantErr  bool
+		name        string
+		tableName   string
+		mode        Mode
+		expectError bool
 	}{
 		{
-			name:     "Valid table",
-			table:    "test_table",
-			expected: "",
-			wantErr:  false,
+			name:        "Valid table with overall mode",
+			tableName:   "test_table",
+			mode:        ModeOverall,
+			expectError: false,
 		},
 		{
-			name:     "Non-existent table",
-			table:    "non_existent_table",
-			expected: "",
-			wantErr:  true,
+			name:        "Valid table with row-by-row mode",
+			tableName:   "test_table",
+			mode:        ModeRowByRow,
+			expectError: false,
 		},
 		{
-			name:     "Large table with multiple batches",
-			table:    "test_table",
-			expected: "",
-			wantErr:  false,
+			name:        "Non-existent table",
+			tableName:   "non_existent_table",
+			mode:        ModeOverall,
+			expectError: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := CalculateChecksum(config, tt.table)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("CalculateChecksum() error = %v, wantErr %v", err, tt.wantErr)
+			result, err := CalculateChecksum(config, tt.tableName, tt.mode)
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("Expected error but got nil")
+				}
 				return
 			}
-			if !tt.wantErr && got == "" {
-				t.Error("CalculateChecksum() returned empty checksum for valid table")
+
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
 			}
-			if !tt.wantErr {
-				// Verify the checksum format
-				var count, sum int64
-				_, err := fmt.Sscanf(got, "%d-%d", &count, &sum)
-				if err != nil {
-					t.Errorf("Invalid checksum format: %s", got)
+
+			if result == nil {
+				t.Errorf("Expected result but got nil")
+				return
+			}
+
+			if tt.mode == ModeRowByRow {
+				// For row-by-row mode, we expect to have validation results
+				if result.FailedRows < 0 {
+					t.Errorf("Invalid failed rows count: %d", result.FailedRows)
+				}
+				if result.FailedRowIDs == nil {
+					t.Errorf("FailedRowIDs should not be nil")
 				}
 			}
 		})
@@ -121,23 +132,24 @@ func TestCompareChecksums(t *testing.T) {
 		expected bool
 	}{
 		{
-			name:     "Matching checksums",
+			name:      "Matching checksums",
 			checksum1: "123456-789012",
 			checksum2: "123456-789012",
-			expected: true,
+			expected:  true,
 		},
 		{
-			name:     "Different checksums",
+			name:      "Different checksums",
 			checksum1: "123456-789012",
-			checksum2: "654321-210987",
-			expected: false,
+			checksum2: "123456-789013",
+			expected:  false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := CompareChecksums(tt.checksum1, tt.checksum2); got != tt.expected {
-				t.Errorf("CompareChecksums() = %v, want %v", got, tt.expected)
+			result := CompareChecksums(tt.checksum1, tt.checksum2)
+			if result != tt.expected {
+				t.Errorf("CompareChecksums() = %v, want %v", result, tt.expected)
 			}
 		})
 	}
