@@ -52,24 +52,26 @@ type ValidationResult struct {
 type dbConnector struct {
 	config *Config
 	dsn    string
+	db     *sql.DB
 }
 
 // newDBConnector creates a new database connector
-func newDBConnector(config *Config) *dbConnector {
+func newDBConnector(config *Config) (*dbConnector, error) {
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", config.User, config.Password, config.Host, config.Port, config.Database)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to database: %v", err)
+	}
 	return &dbConnector{
 		config: config,
 		dsn:    dsn,
-	}
+		db:     db,
+	}, nil
 }
 
 // connect creates a new database connection
 func (dc *dbConnector) connect() (*sql.DB, error) {
-	db, err := sql.Open("mysql", dc.dsn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to database: %v", err)
-	}
-	return db, nil
+	return dc.db, nil
 }
 
 // batchProcessor handles the processing of data in batches
@@ -78,20 +80,41 @@ type batchProcessor struct {
 	info      *metadata.TableInfo
 	mode      Mode
 	batchSize int64
+	pkRanges  []metadata.PKRange
 }
 
 // newBatchProcessor creates a new batch processor
-func newBatchProcessor(connector *dbConnector, info *metadata.TableInfo, mode Mode) *batchProcessor {
+func newBatchProcessor(connector *dbConnector, info *metadata.TableInfo, mode Mode) (*batchProcessor, error) {
+	// Get primary key ranges
+	pkRanges, err := metadata.NewTableMetaProvider(connector.db, &metadata.Config{
+		Host:     connector.config.Host,
+		Port:     connector.config.Port,
+		User:     connector.config.User,
+		Password: connector.config.Password,
+		Database: connector.config.Database,
+	}).GetPKRanges(info.Name, 10000)
+	if err != nil {
+		return nil, err
+	}
+
 	return &batchProcessor{
 		connector: connector,
 		info:      info,
 		mode:      mode,
 		batchSize: 10000,
-	}
+		pkRanges:  pkRanges,
+	}, nil
 }
 
 // processBatch processes a single batch of data
 func (bp *batchProcessor) processBatch(batchNum int64) batchResult {
+	if int(batchNum) >= len(bp.pkRanges) {
+		return batchResult{
+			batchNum: int(batchNum),
+			err:      fmt.Errorf("batch number %d out of range", batchNum),
+		}
+	}
+
 	// Create a new connection for this batch
 	batchDB, err := bp.connector.connect()
 	if err != nil {
@@ -102,13 +125,7 @@ func (bp *batchProcessor) processBatch(batchNum int64) batchResult {
 	}
 	defer batchDB.Close()
 
-	// Calculate the primary key range for this batch
-	startPK := bp.info.MinPK + (batchNum * bp.batchSize)
-	endPK := startPK + bp.batchSize - 1
-	if endPK > bp.info.MaxPK {
-		endPK = bp.info.MaxPK
-	}
-
+	pkRange := bp.pkRanges[batchNum]
 	query := fmt.Sprintf("SELECT %s, %s FROM %s WHERE %s BETWEEN ? AND ? ORDER BY %s",
 		bp.info.PKColumn,
 		strings.Join(bp.info.Columns, ", "),
@@ -116,7 +133,7 @@ func (bp *batchProcessor) processBatch(batchNum int64) batchResult {
 		bp.info.PKColumn,
 		bp.info.PKColumn)
 
-	rows, err := batchDB.Query(query, startPK, endPK)
+	rows, err := batchDB.Query(query, pkRange.StartPK, pkRange.EndPK)
 	if err != nil {
 		return batchResult{
 			batchNum: int(batchNum),
@@ -184,7 +201,10 @@ func (bp *batchProcessor) processRows(rows *sql.Rows, batchNum int64) batchResul
 // CalculateChecksum calculates the checksum for a given table in batches
 func CalculateChecksum(config *Config, tableName string, mode Mode) (*ValidationResult, error) {
 	// Create database connector
-	connector := newDBConnector(config)
+	connector, err := newDBConnector(config)
+	if err != nil {
+		return nil, err
+	}
 
 	// Connect to database
 	db, err := connector.connect()
@@ -209,21 +229,20 @@ func CalculateChecksum(config *Config, tableName string, mode Mode) (*Validation
 	}
 
 	// Create batch processor
-	processor := newBatchProcessor(connector, info, mode)
-
-	// Calculate number of batches based on primary key range
-	totalRange := info.MaxPK - info.MinPK + 1
-	numBatches := (totalRange + processor.batchSize - 1) / processor.batchSize
+	processor, err := newBatchProcessor(connector, info, mode)
+	if err != nil {
+		return nil, err
+	}
 
 	// Process batches
-	results := make([]batchResult, numBatches)
+	results := make([]batchResult, len(processor.pkRanges))
 	var wg sync.WaitGroup
 
-	for i := int64(0); i < numBatches; i++ {
+	for i := 0; i < len(processor.pkRanges); i++ {
 		wg.Add(1)
-		go func(batchNum int64) {
+		go func(batchNum int) {
 			defer wg.Done()
-			results[batchNum] = processor.processBatch(batchNum)
+			results[batchNum] = processor.processBatch(int64(batchNum))
 		}(i)
 	}
 

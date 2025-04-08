@@ -118,6 +118,82 @@ func (p *TableMetaProvider) getPrimaryKeyInfo(tableName string) (string, int64, 
 	return pkColumn, minPK, maxPK, nil
 }
 
+// PKRange represents a range of primary keys
+type PKRange struct {
+	StartPK int64
+	EndPK   int64
+}
+
+// GetPKRanges returns a list of primary key ranges for batch processing
+func (p *TableMetaProvider) GetPKRanges(tableName string, batchSize int64) ([]PKRange, error) {
+	// Get primary key column name
+	var pkColumn string
+	err := p.db.QueryRow(`
+		SELECT column_name 
+		FROM information_schema.columns 
+		WHERE table_schema = ? 
+		AND table_name = ? 
+		AND column_key = 'PRI'`,
+		p.config.Database, tableName).Scan(&pkColumn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get primary key column: %v", err)
+	}
+
+	// Query to get primary key ranges
+	query := fmt.Sprintf(`
+		WITH RECURSIVE ranges AS (
+			SELECT MIN(%s) as start_pk
+			FROM %s
+			UNION ALL
+			SELECT (
+				SELECT MIN(%s)
+				FROM %s
+				WHERE %s > r.start_pk
+				LIMIT 1
+			)
+			FROM ranges r
+			WHERE r.start_pk IS NOT NULL
+		)
+		SELECT start_pk
+		FROM ranges
+		WHERE start_pk IS NOT NULL
+		ORDER BY start_pk`, pkColumn, tableName, pkColumn, tableName, pkColumn)
+
+	rows, err := p.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get primary key ranges: %v", err)
+	}
+	defer rows.Close()
+
+	var pks []int64
+	for rows.Next() {
+		var pk int64
+		if err := rows.Scan(&pk); err != nil {
+			return nil, fmt.Errorf("failed to scan primary key: %v", err)
+		}
+		pks = append(pks, pk)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating primary keys: %v", err)
+	}
+
+	// Group primary keys into ranges
+	var ranges []PKRange
+	for i := 0; i < len(pks); i += int(batchSize) {
+		end := i + int(batchSize)
+		if end > len(pks) {
+			end = len(pks)
+		}
+		ranges = append(ranges, PKRange{
+			StartPK: pks[i],
+			EndPK:   pks[end-1],
+		})
+	}
+
+	return ranges, nil
+}
+
 // GetTableInfo retrieves table information by coordinating multiple operations
 func (p *TableMetaProvider) GetTableInfo(tableName string) (*TableInfo, error) {
 	// First verify table exists
