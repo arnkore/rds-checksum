@@ -78,11 +78,25 @@ type tableInfo struct {
 	rowCount int64
 }
 
+// TableMetaProvider handles fetching table metadata
+type TableMetaProvider struct {
+	db     *sql.DB
+	config *Config
+}
+
+// newTableMetaProvider creates a new TableMetaProvider
+func newTableMetaProvider(db *sql.DB, config *Config) *TableMetaProvider {
+	return &TableMetaProvider{
+		db:     db,
+		config: config,
+	}
+}
+
 // verifyTableExists checks if the specified table exists in the database
-func (dc *dbConnector) verifyTableExists(db *sql.DB, tableName string) error {
+func (p *TableMetaProvider) verifyTableExists(tableName string) error {
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
-		dc.config.Database, tableName).Scan(&count)
+	err := p.db.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+		p.config.Database, tableName).Scan(&count)
 	if err != nil {
 		return fmt.Errorf("failed to check table existence: %v", err)
 	}
@@ -93,9 +107,9 @@ func (dc *dbConnector) verifyTableExists(db *sql.DB, tableName string) error {
 }
 
 // getTableRowCount retrieves the total number of rows in the table
-func (dc *dbConnector) getTableRowCount(db *sql.DB, tableName string) (int64, error) {
+func (p *TableMetaProvider) getTableRowCount(tableName string) (int64, error) {
 	var totalRows int64
-	err := db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)).Scan(&totalRows)
+	err := p.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)).Scan(&totalRows)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get total row count: %v", err)
 	}
@@ -103,14 +117,14 @@ func (dc *dbConnector) getTableRowCount(db *sql.DB, tableName string) (int64, er
 }
 
 // getTableColumns retrieves all column names for the table
-func (dc *dbConnector) getTableColumns(db *sql.DB, tableName string) ([]string, error) {
-	rows, err := db.Query(`
+func (p *TableMetaProvider) getTableColumns(tableName string) ([]string, error) {
+	rows, err := p.db.Query(`
 		SELECT column_name 
 		FROM information_schema.columns 
 		WHERE table_schema = ? 
 		AND table_name = ? 
 		ORDER BY ordinal_position`,
-		dc.config.Database, tableName)
+		p.config.Database, tableName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get columns: %v", err)
 	}
@@ -133,20 +147,20 @@ func (dc *dbConnector) getTableColumns(db *sql.DB, tableName string) ([]string, 
 }
 
 // getTableInfo retrieves table information by coordinating multiple operations
-func (dc *dbConnector) getTableInfo(db *sql.DB, tableName string) (*tableInfo, error) {
+func (p *TableMetaProvider) getTableInfo(tableName string) (*tableInfo, error) {
 	// First verify table exists
-	if err := dc.verifyTableExists(db, tableName); err != nil {
+	if err := p.verifyTableExists(tableName); err != nil {
 		return nil, err
 	}
 
 	// Get row count
-	rowCount, err := dc.getTableRowCount(db, tableName)
+	rowCount, err := p.getTableRowCount(tableName)
 	if err != nil {
 		return nil, err
 	}
 
 	// Get columns
-	columns, err := dc.getTableColumns(db, tableName)
+	columns, err := p.getTableColumns(tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +275,7 @@ func (bp *batchProcessor) processRows(rows *sql.Rows, batchNum int64) batchResul
 func CalculateChecksum(config *Config, tableName string, mode Mode) (*ValidationResult, error) {
 	// Create database connector
 	connector := newDBConnector(config)
-	
+
 	// Connect to database
 	db, err := connector.connect()
 	if err != nil {
@@ -269,8 +283,11 @@ func CalculateChecksum(config *Config, tableName string, mode Mode) (*Validation
 	}
 	defer db.Close()
 
+	// Create TableMetaProvider
+	metaProvider := newTableMetaProvider(db, config)
+
 	// Get table information
-	info, err := connector.getTableInfo(db, tableName)
+	info, err := metaProvider.getTableInfo(tableName)
 	if err != nil {
 		return nil, err
 	}
