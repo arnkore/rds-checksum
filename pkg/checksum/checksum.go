@@ -73,33 +73,43 @@ func (dc *dbConnector) connect() (*sql.DB, error) {
 
 // tableInfo holds information about a database table
 type tableInfo struct {
-	name    string
-	columns []string
+	name     string
+	columns  []string
 	rowCount int64
 }
 
-// getTableInfo retrieves table information
-func (dc *dbConnector) getTableInfo(db *sql.DB, tableName string) (*tableInfo, error) {
-	// Verify table exists
+// verifyTableExists checks if the specified table exists in the database
+func (dc *dbConnector) verifyTableExists(db *sql.DB, tableName string) error {
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?", 
+	err := db.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
 		dc.config.Database, tableName).Scan(&count)
 	if err != nil {
-		return nil, fmt.Errorf("failed to check table existence: %v", err)
+		return fmt.Errorf("failed to check table existence: %v", err)
 	}
 	if count == 0 {
-		return nil, fmt.Errorf("table %s does not exist", tableName)
+		return fmt.Errorf("table %s does not exist", tableName)
 	}
+	return nil
+}
 
-	// Get total row count
+// getTableRowCount retrieves the total number of rows in the table
+func (dc *dbConnector) getTableRowCount(db *sql.DB, tableName string) (int64, error) {
 	var totalRows int64
-	err = db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)).Scan(&totalRows)
+	err := db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)).Scan(&totalRows)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get total row count: %v", err)
+		return 0, fmt.Errorf("failed to get total row count: %v", err)
 	}
+	return totalRows, nil
+}
 
-	// Get all columns for the table
-	rows, err := db.Query("SELECT column_name FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
+// getTableColumns retrieves all column names for the table
+func (dc *dbConnector) getTableColumns(db *sql.DB, tableName string) ([]string, error) {
+	rows, err := db.Query(`
+		SELECT column_name 
+		FROM information_schema.columns 
+		WHERE table_schema = ? 
+		AND table_name = ? 
+		ORDER BY ordinal_position`,
 		dc.config.Database, tableName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get columns: %v", err)
@@ -119,10 +129,32 @@ func (dc *dbConnector) getTableInfo(db *sql.DB, tableName string) (*tableInfo, e
 		return nil, fmt.Errorf("error iterating columns: %v", err)
 	}
 
+	return columns, nil
+}
+
+// getTableInfo retrieves table information by coordinating multiple operations
+func (dc *dbConnector) getTableInfo(db *sql.DB, tableName string) (*tableInfo, error) {
+	// First verify table exists
+	if err := dc.verifyTableExists(db, tableName); err != nil {
+		return nil, err
+	}
+
+	// Get row count
+	rowCount, err := dc.getTableRowCount(db, tableName)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get columns
+	columns, err := dc.getTableColumns(db, tableName)
+	if err != nil {
+		return nil, err
+	}
+
 	return &tableInfo{
 		name:     tableName,
 		columns:  columns,
-		rowCount: totalRows,
+		rowCount: rowCount,
 	}, nil
 }
 
