@@ -8,7 +8,7 @@ import (
 	"crypto/md5"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/liuzonghao/mychecksum/pkg/checksum/metadata"
+	"github.com/liuzonghao/mychecksum/pkg/metadata"
 )
 
 // Config holds the MySQL connection configuration
