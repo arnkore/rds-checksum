@@ -20,7 +20,7 @@ func NewTableMetaProvider(dbProvider *DbConnProvider, tableName string) *TableMe
 // verifyTableExists checks if the specified table exists in the database
 func (p *TableMetaProvider) verifyTableExists(tableName string) (bool, error) {
 	var count int
-	err := p.getDbConn().QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+	err := p.getDbConn().QueryRow("SELECT COUNT(1) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
 		p.GetDatabaseName(), tableName).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("failed to check table existence: %v", err)
@@ -34,7 +34,7 @@ func (p *TableMetaProvider) verifyTableExists(tableName string) (bool, error) {
 // getTableRowCount retrieves the total number of rows in the table
 func (p *TableMetaProvider) getTableRowCount(tableName string) (int64, error) {
 	var totalRows int64
-	err := p.getDbConn().QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)).Scan(&totalRows)
+	err := p.getDbConn().QueryRow(fmt.Sprintf("SELECT COUNT(1) FROM %s", tableName)).Scan(&totalRows)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get total row count: %v", err)
 	}
@@ -75,12 +75,7 @@ func (p *TableMetaProvider) getTableColumns(tableName string) ([]string, error) 
 func (p *TableMetaProvider) getPrimaryKeyInfo(tableName string) (string, error) {
 	// Get primary key column name
 	var pkColumn string
-	err := p.getDbConn().QueryRow(`
-		SELECT column_name 
-		FROM information_schema.columns 
-		WHERE table_schema = ? 
-		AND table_name = ? 
-		AND column_key = 'PRI'`,
+	err := p.getDbConn().QueryRow("SELECT column_name FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_key = 'PRI'",
 		p.GetDatabaseName(), tableName).Scan(&pkColumn)
 	if err != nil {
 		return "", fmt.Errorf("failed to get primary key column: %v", err)
@@ -91,7 +86,7 @@ func (p *TableMetaProvider) getPrimaryKeyInfo(tableName string) (string, error) 
 
 func (p *TableMetaProvider) queryTablePKRange(primaryKey string, tableName string) (*PKRange, error) {
 	var minPK, maxPK int64
-	queryMinMax := fmt.Sprintf("SELECT MIN(`%s`), MAX(`%s`) FROM `%s`", primaryKey, primaryKey, tableName)
+	queryMinMax := fmt.Sprintf("SELECT MIN(%s), MAX(%s) FROM %s", primaryKey, primaryKey, tableName)
 	err := p.getDbConn().QueryRow(queryMinMax).Scan(&minPK, &maxPK)
 	if err != nil {
 		// Handle cases like empty table (though checked earlier) or non-numeric PK if assumption is wrong

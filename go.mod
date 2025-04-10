@@ -1,10 +1,11 @@
-module mychecksum
+module github.com/arnkore/rds-checksum
 
 go 1.23.0
 
 toolchain go1.23.8
 
 require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/go-sql-driver/mysql v1.9.1
 	github.com/stretchr/testify v1.10.0
 	golang.org/x/sync v0.13.0
@@ -16,3 +17,5 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/arnkore/rds-checksum => ./
