@@ -1,4 +1,4 @@
-module github.com/liuzonghao/mychecksum
+module mychecksum
 
 go 1.23.0
 
@@ -16,5 +16,3 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/liuzonghao/mychecksum => ./
