@@ -134,20 +134,8 @@ func main() {
 	}
 
 	// --- Prepare Source/Target Config ---
-	srcConfig := metadata.Config{
-		Host:     *sourceHost,
-		Port:     *sourcePort,
-		User:     *sourceUser,
-		Password: *sourcePassword,
-		Database: *sourceDB,
-	}
-	targetConfig := metadata.Config{
-		Host:     *targetHost,
-		Port:     *targetPort,
-		User:     *targetUser,
-		Password: *targetPassword,
-		Database: *targetDB,
-	}
+	srcConfig := metadata.NewConfig(*sourceHost, *sourcePort, *sourceUser, *sourcePassword, *sourceDB)
+	targetConfig := metadata.NewConfig(*targetHost, *targetPort, *targetUser, *targetPassword, *targetDB)
 
 	// --- Create and run the validator ---
 	// The validator now needs the storage handler

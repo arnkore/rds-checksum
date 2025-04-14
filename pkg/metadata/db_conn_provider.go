@@ -12,7 +12,7 @@ type DbConnProvider struct {
 
 // NewDBConnProvider creates a new DbConnProvider.
 func NewDBConnProvider(config *Config) (*DbConnProvider, error) {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", config.User, config.Password, config.Host, config.Port, config.Database)
+	dsn := config.GenerateDSN()
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database connection: %w", err)

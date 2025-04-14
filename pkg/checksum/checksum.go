@@ -1,12 +1,10 @@
 package checksum
 
 import (
-	"database/sql"
 	"fmt"
-	"log" // Added for logging DB errors
+	"log"     // Added for logging DB errors
 	"runtime" // For default concurrency
 	"sort"
-	"strings"
 	"sync"
 
 	"github.com/arnkore/rds-checksum/pkg/metadata"
@@ -52,8 +50,8 @@ type CompareChecksumResults struct {
 
 // UnifiedChecksumValidator orchestrates the checksum validation process.
 type UnifiedChecksumValidator struct {
-	SrcConfig    metadata.Config // Source Config (e.g., Master)
-	TargetConfig metadata.Config // Target Config (e.g., Replica)
+	SrcConfig    *metadata.Config // Source Config (e.g., Master)
+	TargetConfig *metadata.Config // Target Config (e.g., Replica)
 	TableName    string
 	RowsPerBatch int            // Target number of rows per batch/partition
 	dbStore      *storage.Store // Added: Database store for results
@@ -61,7 +59,7 @@ type UnifiedChecksumValidator struct {
 }
 
 // NewUnifiedChecksumValidator creates a new validator.
-func NewUnifiedChecksumValidator(src, target metadata.Config, tableName string, rowsPerBatch int, store *storage.Store) *UnifiedChecksumValidator {
+func NewUnifiedChecksumValidator(src, target *metadata.Config, tableName string, rowsPerBatch int, store *storage.Store) *UnifiedChecksumValidator {
 	return &UnifiedChecksumValidator{
 		SrcConfig:    src,
 		TargetConfig: target,
@@ -85,33 +83,14 @@ func errorToString(err error) string {
 	return err.Error()
 }
 
-// Helper function to create a simplified connection info string (masking password)
-func getSimplifiedConnInfo(config *metadata.Config) string {
-	// Rudimentary parsing, assumes DSN format user:pass@tcp(host:port)/db
-	// This should be made more robust in a real application
-	dsn := config.DSN
-	user := ""
-	passEnd := -1
-	if idx := strings.Index(dsn, ":"); idx != -1 {
-		user = dsn[:idx]
-		passEnd = strings.Index(dsn, "@")
-	}
-	start := 0
-	if passEnd != -1 {
-		start = passEnd + 1
-	}
-	info := dsn[start:]
-	return fmt.Sprintf("%s@%s", user, info)
-}
-
 // Represents the outcome of comparing a single partition
 type PartitionComparisonSummary struct {
-	Index           int
-	Match           bool // True if checksums and row counts match and no errors
-	ChecksumMatch   bool
-	RowCountMatch   bool
-	SourceErr       error
-	TargetErr       error
+	Index         int
+	Match         bool // True if checksums and row counts match and no errors
+	ChecksumMatch bool
+	RowCountMatch bool
+	SourceErr     error
+	TargetErr     error
 }
 
 // updateJobStatus updates the job status in the database.
@@ -168,9 +147,7 @@ func (v *UnifiedChecksumValidator) updateJobStatus(comparisonResult *CompareChec
 // createJobRecord creates a job record in the database.
 func (v *UnifiedChecksumValidator) createJobRecord() error {
 	if v.dbStore != nil {
-		sourceInfo := getSimplifiedConnInfo(&v.SrcConfig)
-		targetInfo := getSimplifiedConnInfo(&v.TargetConfig)
-		jobID, err := v.dbStore.CreateJob(v.TableName, sourceInfo, targetInfo, v.RowsPerBatch)
+		jobID, err := v.dbStore.CreateJob(v.TableName, v.RowsPerBatch)
 		if err != nil {
 			log.Printf("ERROR: Failed to create checksum job in database: %v. Proceeding without DB logging.\n", err)
 			v.dbStore = nil // Disable DB store if creation fails
@@ -188,16 +165,16 @@ func (v *UnifiedChecksumValidator) createJobRecord() error {
 }
 
 // setupConnectionsAndMetadata establishes DB connections, fetches metadata, and performs initial checks.
-func (v *UnifiedChecksumValidator) setupConnectionsAndMetadata() (*metadata.DBConnProvider, *metadata.DBConnProvider, *metadata.TableInfo, *metadata.TableInfo, error) {
+func (v *UnifiedChecksumValidator) setupConnectionsAndMetadata() (*metadata.DbConnProvider, *metadata.DbConnProvider, *metadata.TableInfo, *metadata.TableInfo, error) {
 	var srcInfo, targetInfo *metadata.TableInfo
 	var srcMetaErr, targetMetaErr error
 
-	srcProvider, srcMetaErr := metadata.NewDBConnProvider(&v.SrcConfig)
+	srcProvider, srcMetaErr := metadata.NewDBConnProvider(v.SrcConfig)
 	if srcMetaErr != nil {
 		return nil, nil, nil, nil, fmt.Errorf("source provider init failed: %w", srcMetaErr)
 	}
 
-	targetProvider, targetMetaErr := metadata.NewDBConnProvider(&v.TargetConfig)
+	targetProvider, targetMetaErr := metadata.NewDBConnProvider(v.TargetConfig)
 	if targetMetaErr != nil {
 		srcProvider.Close() // Close source provider if target fails
 		return nil, nil, nil, nil, fmt.Errorf("target provider init failed: %w", targetMetaErr)
@@ -266,18 +243,19 @@ func (v *UnifiedChecksumValidator) calculatePartitions(srcInfo *metadata.TableIn
 }
 
 // processPartitionsConcurrently calculates checksums, compares, saves results, and returns summaries.
-func (v *UnifiedChecksumValidator) processPartitionsConcurrently(
-	srcProvider *metadata.DBConnProvider,
-	targetProvider *metadata.DBConnProvider,
+func (v *UnifiedChecksumValidator) processPartitionsConcurrently(srcProvider *metadata.DbConnProvider,
+	targetProvider *metadata.DbConnProvider,
 	srcInfo *metadata.TableInfo,
 	targetInfo *metadata.TableInfo,
-	partitions []metadata.Partition,
-) ([]PartitionComparisonSummary, error) {
-
+	partitions []metadata.Partition) ([]PartitionComparisonSummary, error) {
 	var eg errgroup.Group
 	concurrencyLimit := runtime.NumCPU() * 2
-	if concurrencyLimit < 2 { concurrencyLimit = 2 }
-	if concurrencyLimit > 16 { concurrencyLimit = 16 }
+	if concurrencyLimit < 2 {
+		concurrencyLimit = 2
+	}
+	if concurrencyLimit > 16 {
+		concurrencyLimit = 16
+	}
 	eg.SetLimit(concurrencyLimit)
 	fmt.Printf("Processing %d partitions with concurrency limit %d...\n", len(partitions), concurrencyLimit)
 
@@ -439,8 +417,8 @@ func (v *UnifiedChecksumValidator) RunValidation() (finalResult *CompareChecksum
 
 	// Initialize result struct
 	comparisonResult := &CompareChecksumResults{
-		Match:            true, // Assume match initially
-		TargetFailedRows: make(map[interface{}]string),
+		Match:              true, // Assume match initially
+		TargetFailedRows:   make(map[interface{}]string),
 		MismatchPartitions: []int{}, // Initialize slice
 	}
 
@@ -458,9 +436,13 @@ func (v *UnifiedChecksumValidator) RunValidation() (finalResult *CompareChecksum
 	if err != nil {
 		// If setup fails, comparisonResult might be partially populated by setup function
 		// Need to ensure comparisonResult is updated correctly for early exit
-		if srcInfo != nil { comparisonResult.SrcTotalRows = srcInfo.RowCount }
-		if targetInfo != nil { comparisonResult.TargetTotalRows = targetInfo.RowCount }
-		comparisonResult.Match = false 
+		if srcInfo != nil {
+			comparisonResult.SrcTotalRows = srcInfo.RowCount
+		}
+		if targetInfo != nil {
+			comparisonResult.TargetTotalRows = targetInfo.RowCount
+		}
+		comparisonResult.Match = false
 		finalError = fmt.Errorf("setup failed: %w", err)
 		return comparisonResult, finalError // Return immediately on setup failure
 	}
@@ -496,7 +478,7 @@ func (v *UnifiedChecksumValidator) RunValidation() (finalResult *CompareChecksum
 	// 6. Process Partitions if any exist
 	if len(partitions) > 0 {
 		partitionSummaries, groupErr := v.processPartitionsConcurrently(srcProvider, targetProvider, srcInfo, targetInfo, partitions)
-		
+
 		// Aggregate results from partition processing
 		v.aggregatePartitionResults(partitionSummaries, comparisonResult)
 
@@ -504,7 +486,7 @@ func (v *UnifiedChecksumValidator) RunValidation() (finalResult *CompareChecksum
 			// A critical error occurred during concurrent processing
 			log.Printf("Critical error during partition processing: %v", groupErr)
 			comparisonResult.Match = false // Ensure mismatch on critical error
-			if finalError == nil { // Don't overwrite earlier errors
+			if finalError == nil {         // Don't overwrite earlier errors
 				finalError = groupErr
 			}
 		}

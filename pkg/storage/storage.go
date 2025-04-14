@@ -22,8 +22,6 @@ const (
 CREATE TABLE IF NOT EXISTS checksum_jobs (
     job_id BIGINT AUTO_INCREMENT PRIMARY KEY,
     table_name VARCHAR(255) NOT NULL,
-    source_info TEXT,
-    target_info TEXT,
     rows_per_batch INT,
     status VARCHAR(50) NOT NULL DEFAULT 'pending', -- pending, running, completed, failed
     overall_match BOOLEAN NULL,
@@ -77,15 +75,14 @@ func (s *Store) InitializeSchema() error {
 }
 
 // CreateJob inserts a new job record and returns its ID.
-func (s *Store) CreateJob(tableName, sourceInfo, targetInfo string, rowsPerBatch int) (int64, error) {
+func (s *Store) CreateJob(tableName string, rowsPerBatch int) (int64, error) {
 	if s.db == nil {
 		return 0, fmt.Errorf("database connection is nil")
 	}
-	// Placeholder implementation
-	query := `INSERT INTO checksum_jobs (table_name, source_info, target_info, rows_per_batch, status, start_time)
-	          VALUES (?, ?, ?, ?, ?, ?)`
+	query := `INSERT INTO checksum_jobs (table_name, rows_per_batch, status, start_time)
+	          VALUES (?, ?, ?, ?)`
 	startTime := time.Now()
-	result, err := s.db.Exec(query, tableName, sourceInfo, targetInfo, rowsPerBatch, "pending", startTime)
+	result, err := s.db.Exec(query, tableName, rowsPerBatch, "pending", startTime)
 	if err != nil {
 		return 0, fmt.Errorf("failed to insert new job: %w", err)
 	}
@@ -101,7 +98,6 @@ func (s *Store) UpdateJobStatus(jobID int64, status string, errorMessage string)
 	if s.db == nil {
 		return fmt.Errorf("database connection is nil")
 	}
-	// Placeholder implementation
 	var query string
 	var args []interface{}
 
@@ -125,7 +121,6 @@ func (s *Store) UpdateJobCompletion(jobID int64, status string, overallMatch boo
 	if s.db == nil {
 		return fmt.Errorf("database connection is nil")
 	}
-	// Placeholder implementation
 	query := `UPDATE checksum_jobs
 	          SET status = ?, overall_match = ?, source_total_rows = ?, target_total_rows = ?,
 	              mismatched_partitions_count = ?, end_time = ?, error_message = ?
@@ -157,7 +152,6 @@ func (s *Store) SavePartitionResult(data PartitionResultData) error {
 	if s.db == nil {
 		return fmt.Errorf("database connection is nil")
 	}
-	// Placeholder implementation
 	query := `INSERT INTO partition_results (job_id, partition_index, source_checksum, target_checksum,
 	                                        source_row_count, target_row_count, checksum_match, row_count_match,
 	                                        source_error, target_error, comparison_time)
@@ -166,7 +160,7 @@ func (s *Store) SavePartitionResult(data PartitionResultData) error {
 	_, err := s.db.Exec(query, data.JobID, data.PartitionIndex,
 		sql.NullString{String: data.SourceChecksum, Valid: data.SourceChecksum != ""},
 		sql.NullString{String: data.TargetChecksum, Valid: data.TargetChecksum != ""},
-		sql.NullInt64{Int64: data.SourceRowCount, Valid: true}, // Assuming row count is always known
+		sql.NullInt64{Int64: data.SourceRowCount, Valid: true},
 		sql.NullInt64{Int64: data.TargetRowCount, Valid: true},
 		data.ChecksumMatch, data.RowCountMatch,
 		sql.NullString{String: data.SourceError, Valid: data.SourceError != ""},

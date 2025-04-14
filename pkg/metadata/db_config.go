@@ -1,5 +1,7 @@
 package metadata
 
+import "fmt"
+
 // Config holds the MySQL connection configuration
 type Config struct {
 	Host     string
@@ -9,13 +11,13 @@ type Config struct {
 	Database string
 }
 
-func NewConfig() *Config {
+func NewConfig(host string, port int, user string, password string, database string) *Config {
 	return &Config{
-		Host: config.Host,
-		Port: config.Port,
-		User: config.User,
-		Password: config.Password,
-		Database: config.Database,
+		Host:     host,
+		Port:     port,
+		User:     user,
+		Password: password,
+		Database: database,
 	}
 }
 
