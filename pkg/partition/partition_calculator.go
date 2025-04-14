@@ -2,7 +2,7 @@ package partition
 
 import (
 	"fmt"
-	"mychecksum/pkg/metadata"
+	"github.com/arnkore/rds-checksum/pkg/metadata"
 )
 
 // PartitionCalculator determines how to divide a table into partitions.

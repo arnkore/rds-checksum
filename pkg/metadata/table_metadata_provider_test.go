@@ -191,9 +191,9 @@ func (s *TableMetaProviderTestSuite) TestQueryTablePKRange_Success() {
 	tableName := "test_table"
 	pkColumn := "id"
 	minPK, maxPK := int64(1), int64(1000)
-	rows := sqlmock.NewRows([]string{"MIN(`id`)", "MAX(`id`)"}).AddRow(minPK, maxPK)
+	rows := sqlmock.NewRows([]string{"MIN(id)", "MAX(id)"}).AddRow(minPK, maxPK)
 
-	queryPattern := fmt.Sprintf("SELECT MIN(.+), MAX(.+) FROM `%s`", tableName)
+	queryPattern := fmt.Sprintf(`SELECT MIN\(id\), MAX\(id\) FROM %s`, tableName)
 	s.mock.ExpectQuery(queryPattern).WillReturnRows(rows)
 
 	pkRange, err := s.provider.queryTablePKRange(pkColumn, tableName)

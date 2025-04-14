@@ -3,8 +3,8 @@ package checksum
 import (
 	"database/sql"
 	"fmt"
-	"mychecksum/pkg/metadata"
-	"mychecksum/pkg/partition"
+	"github.com/arnkore/rds-checksum/pkg/metadata"
+	"github.com/arnkore/rds-checksum/pkg/partition"
 	"sort"
 	"sync"
 

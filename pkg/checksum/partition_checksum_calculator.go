@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
-	"mychecksum/pkg/metadata"
+	"github.com/arnkore/rds-checksum/pkg/metadata"
 	"strings"
 )
 

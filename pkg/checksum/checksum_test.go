@@ -2,9 +2,9 @@ package checksum
 
 import (
 	"fmt"
+	"github.com/arnkore/rds-checksum/pkg/metadata"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"mychecksum/pkg/metadata"
 	"os"
 	"os/exec"
 	"path/filepath"
