@@ -10,15 +10,6 @@ type DbConnProvider struct {
 	dbConn       *sql.DB
 }
 
-// Config holds the MySQL connection configuration
-type Config struct {
-	Host     string
-	Port     int
-	User     string
-	Password string
-	Database string
-}
-
 // NewDBConnProvider creates a new DbConnProvider.
 func NewDBConnProvider(config *Config) (*DbConnProvider, error) {
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", config.User, config.Password, config.Host, config.Port, config.Database)

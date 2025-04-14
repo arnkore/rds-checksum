@@ -3,10 +3,15 @@ package checksum
 import (
 	"database/sql"
 	"fmt"
+	"log" // Added for logging DB errors
+	"runtime" // For default concurrency
+	"sort"
+	"strings"
+	"sync"
+
 	"github.com/arnkore/rds-checksum/pkg/metadata"
 	"github.com/arnkore/rds-checksum/pkg/partition"
-	"sort"
-	"sync"
+	"github.com/arnkore/rds-checksum/pkg/storage" // Added storage import
 
 	_ "github.com/go-sql-driver/mysql"
 	"golang.org/x/sync/errgroup"
@@ -47,256 +52,475 @@ type CompareChecksumResults struct {
 
 // UnifiedChecksumValidator orchestrates the checksum validation process.
 type UnifiedChecksumValidator struct {
-	SrcConfig     metadata.Config // Source Config (e.g., Master)
-	TargetConfig  metadata.Config // Target Config (e.g., Replica)
-	TableName     string
-	NumPartitions int // Number of partitions to use
+	SrcConfig    metadata.Config // Source Config (e.g., Master)
+	TargetConfig metadata.Config // Target Config (e.g., Replica)
+	TableName    string
+	RowsPerBatch int            // Target number of rows per batch/partition
+	dbStore      *storage.Store // Added: Database store for results
+	jobID        int64          // Added: ID of the current job in the DB
 }
 
 // NewUnifiedChecksumValidator creates a new validator.
-func NewUnifiedChecksumValidator(src, target metadata.Config, tableName string, numPartitions int) *UnifiedChecksumValidator {
+func NewUnifiedChecksumValidator(src, target metadata.Config, tableName string, rowsPerBatch int, store *storage.Store) *UnifiedChecksumValidator {
 	return &UnifiedChecksumValidator{
-		SrcConfig:     src,
-		TargetConfig:  target,
-		TableName:     tableName,
-		NumPartitions: numPartitions,
+		SrcConfig:    src,
+		TargetConfig: target,
+		TableName:    tableName,
+		RowsPerBatch: rowsPerBatch,
+		dbStore:      store, // Added
+		jobID:        0,     // Initialized
 	}
 }
 
-// CalculateChecksumInPartitions calculates checksums for all partitions in parallel.
-func (c *UnifiedChecksumValidator) CalculateChecksumInPartitions(dbConn *sql.DB, tableInfo *metadata.TableInfo, partitions []metadata.Partition) (map[int]PartitionChecksumResult, error) {
-	if tableInfo == nil || !tableInfo.TableExists {
-		return nil, fmt.Errorf("table %s does not exist or info not loaded", tableInfo)
-	}
-	resultsChan := make(chan PartitionChecksumResult, len(partitions))
-	var eg errgroup.Group
-	columns := tableInfo.Columns
+// GetJobID returns the database job ID associated with this validation run.
+func (v *UnifiedChecksumValidator) GetJobID() int64 {
+	return v.jobID
+}
 
-	for _, p := range partitions {
-		part := p // Capture loop variable for goroutine
-		pcc := NewPartitionChecksumCalculator(&part)
-		eg.Go(func() error {
-			checksum, rowCount, err := pcc.CalculateChecksum(dbConn, columns)
-			resultsChan <- PartitionChecksumResult{
-				Partition: part,
-				Checksum:  checksum,
-				RowCount:  rowCount,
-				Error:     err, // Pass error along in the result struct
+// Helper function to safely convert error to string for DB storage
+func errorToString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// Helper function to create a simplified connection info string (masking password)
+func getSimplifiedConnInfo(config *metadata.Config) string {
+	// Rudimentary parsing, assumes DSN format user:pass@tcp(host:port)/db
+	// This should be made more robust in a real application
+	dsn := config.DSN
+	user := ""
+	passEnd := -1
+	if idx := strings.Index(dsn, ":"); idx != -1 {
+		user = dsn[:idx]
+		passEnd = strings.Index(dsn, "@")
+	}
+	start := 0
+	if passEnd != -1 {
+		start = passEnd + 1
+	}
+	info := dsn[start:]
+	return fmt.Sprintf("%s@%s", user, info)
+}
+
+// Represents the outcome of comparing a single partition
+type PartitionComparisonSummary struct {
+	Index           int
+	Match           bool // True if checksums and row counts match and no errors
+	ChecksumMatch   bool
+	RowCountMatch   bool
+	SourceErr       error
+	TargetErr       error
+}
+
+// updateJobStatus updates the job status in the database.
+func (v *UnifiedChecksumValidator) updateJobStatus(comparisonResult *CompareChecksumResults, finalError error) {
+	if v.dbStore != nil && v.jobID > 0 {
+		status := "completed"
+		errMsg := ""
+		mismatchedCount := 0
+
+		// Ensure comparisonResult is not nil before accessing
+		if comparisonResult != nil {
+			if !comparisonResult.Match {
+				status = "completed_mismatch"
 			}
-			// Only return non-nil error to errgroup if it's critical and should stop everything
-			// For checksum, often we want all results even if some fail, so return nil here.
-			// The error is handled when collecting results.
-			return err // If we want to stop on first error, return err here. Otherwise return nil.
-		})
-	}
-
-	// Wait for all goroutines to complete. errgroup.Wait() returns the first non-nil error.
-	waitErr := eg.Wait() // Capture potential error from the errgroup
-
-	close(resultsChan) // Close channel once all goroutines are done
-
-	// Collect results
-	results := make(map[int]PartitionChecksumResult)
-	var totalRowCount int64 = 0
-	var firstError = waitErr // Initialize with potential error from Wait()
-
-	for result := range resultsChan {
-		if result.Error != nil && firstError == nil {
-			firstError = result.Error // Capture the first error encountered
+			mismatchedCount = len(comparisonResult.MismatchPartitions)
+		} else {
+			// If comparisonResult is nil, it implies an early failure
+			status = "failed"
+			if finalError == nil {
+				finalError = fmt.Errorf("unknown early failure, comparison result is nil")
+			}
 		}
-		results[result.Partition.Index] = result
-		totalRowCount += result.RowCount
-	}
 
-	// If an error occurred in any goroutine (captured by firstError), return it.
-	if firstError != nil {
-		return results, fmt.Errorf("error during partition checksum calculation: %w", firstError)
-	}
+		if finalError != nil {
+			status = "failed"
+			errMsg = errorToString(finalError)
+		}
 
-	return results, nil
+		// Safely access comparisonResult fields, providing defaults if nil
+		matchStatus := false
+		srcRows, tgtRows := int64(0), int64(0)
+		if comparisonResult != nil {
+			matchStatus = comparisonResult.Match
+			srcRows = comparisonResult.SrcTotalRows
+			tgtRows = comparisonResult.TargetTotalRows
+		}
+
+		log.Printf("Attempting to update job %d completion status: %s, match: %t, srcRows: %d, tgtRows: %d, mismatches: %d, error: '%s'",
+			v.jobID, status, matchStatus, srcRows, tgtRows, mismatchedCount, errMsg)
+
+		err := v.dbStore.UpdateJobCompletion(v.jobID, status, matchStatus, srcRows, tgtRows, mismatchedCount, errMsg)
+		if err != nil {
+			log.Printf("ERROR: Failed to update final job status for job %d: %v\n", v.jobID, err)
+		} else {
+			fmt.Printf("Job %d final status updated to %s.\n", v.jobID, status)
+		}
+	} else if finalError != nil {
+		log.Printf("Validation finished with error (DB not configured or job creation failed): %v", finalError)
+	} else if comparisonResult != nil {
+		log.Printf("Validation finished (DB not configured or job creation failed). Match status: %t", comparisonResult.Match)
+	}
 }
 
-// RunValidation performs the checksum validation.
-func (v *UnifiedChecksumValidator) RunValidation() (*CompareChecksumResults, error) {
-	fmt.Printf("Starting unified checksum validation for table %s...\n", v.TableName)
-	comparisonResult := &CompareChecksumResults{
-		TargetFailedRows: make(map[interface{}]string),
+// createJobRecord creates a job record in the database.
+func (v *UnifiedChecksumValidator) createJobRecord() error {
+	if v.dbStore != nil {
+		sourceInfo := getSimplifiedConnInfo(&v.SrcConfig)
+		targetInfo := getSimplifiedConnInfo(&v.TargetConfig)
+		jobID, err := v.dbStore.CreateJob(v.TableName, sourceInfo, targetInfo, v.RowsPerBatch)
+		if err != nil {
+			log.Printf("ERROR: Failed to create checksum job in database: %v. Proceeding without DB logging.\n", err)
+			v.dbStore = nil // Disable DB store if creation fails
+			return nil      // Don't treat failure to create job as fatal for checksum itself
+		}
+		v.jobID = jobID
+		fmt.Printf("Created database job with ID: %d\n", v.jobID)
+		err = v.dbStore.UpdateJobStatus(v.jobID, "running", "")
+		if err != nil {
+			// Log error but continue, status update isn't critical for checksum logic
+			log.Printf("ERROR: Failed to update job %d status to running: %v\n", v.jobID, err)
+		}
 	}
+	return nil
+}
 
-	// 1. Get Table Metadata for both sources concurrently
-	var sourceTableInfo, targetTableInfo *metadata.TableInfo
+// setupConnectionsAndMetadata establishes DB connections, fetches metadata, and performs initial checks.
+func (v *UnifiedChecksumValidator) setupConnectionsAndMetadata() (*metadata.DBConnProvider, *metadata.DBConnProvider, *metadata.TableInfo, *metadata.TableInfo, error) {
+	var srcInfo, targetInfo *metadata.TableInfo
 	var srcMetaErr, targetMetaErr error
-	srcDbConnProvider, srcMetaErr := metadata.NewDBConnProvider(&v.SrcConfig)
+
+	srcProvider, srcMetaErr := metadata.NewDBConnProvider(&v.SrcConfig)
 	if srcMetaErr != nil {
-		srcMetaErr = fmt.Errorf("source1 meta provider: %w", srcMetaErr)
-		return comparisonResult, srcMetaErr
-	}
-	targetDbConnProvider, targetMetaErr := metadata.NewDBConnProvider(&v.TargetConfig)
-	if targetMetaErr != nil {
-		targetMetaErr = fmt.Errorf("source1 meta provider: %w", targetMetaErr)
-		return comparisonResult, targetMetaErr
+		return nil, nil, nil, nil, fmt.Errorf("source provider init failed: %w", srcMetaErr)
 	}
 
+	targetProvider, targetMetaErr := metadata.NewDBConnProvider(&v.TargetConfig)
+	if targetMetaErr != nil {
+		srcProvider.Close() // Close source provider if target fails
+		return nil, nil, nil, nil, fmt.Errorf("target provider init failed: %w", targetMetaErr)
+	}
+
+	// Get metadata concurrently
 	var wgMeta sync.WaitGroup
 	wgMeta.Add(2)
 	go func() {
 		defer wgMeta.Done()
-		srcTableMetaProvider := metadata.NewTableMetaProvider(srcDbConnProvider, v.TableName)
-		sourceTableInfo, srcMetaErr = srcTableMetaProvider.GetTableInfo(v.TableName)
+		srcMetaProvider := metadata.NewTableMetaProvider(srcProvider, v.TableName)
+		srcInfo, srcMetaErr = srcMetaProvider.GetTableInfo(v.TableName)
 	}()
 	go func() {
 		defer wgMeta.Done()
-		targetTableMetaProvider := metadata.NewTableMetaProvider(targetDbConnProvider, v.TableName)
-		targetTableInfo, targetMetaErr = targetTableMetaProvider.GetTableInfo(v.TableName)
+		targetMetaProvider := metadata.NewTableMetaProvider(targetProvider, v.TableName)
+		targetInfo, targetMetaErr = targetMetaProvider.GetTableInfo(v.TableName)
 	}()
 	wgMeta.Wait()
 
 	if srcMetaErr != nil {
-		return nil, fmt.Errorf("failed getting metadata from source 1: %w", srcMetaErr)
+		srcProvider.Close()
+		targetProvider.Close()
+		return nil, nil, nil, nil, fmt.Errorf("failed getting metadata from source 1: %w", srcMetaErr)
 	}
 	if targetMetaErr != nil {
-		return nil, fmt.Errorf("failed getting metadata from source 2: %w", targetMetaErr)
+		srcProvider.Close()
+		targetProvider.Close()
+		return nil, nil, nil, nil, fmt.Errorf("failed getting metadata from source 2: %w", targetMetaErr)
 	}
 
-	if !sourceTableInfo.TableExists || !targetTableInfo.TableExists {
-		// Handle cases where table exists on one source but not the other
-		if sourceTableInfo.TableExists != targetTableInfo.TableExists {
+	// Check for table existence mismatch
+	if !srcInfo.TableExists || !targetInfo.TableExists {
+		if srcInfo.TableExists != targetInfo.TableExists {
+			srcProvider.Close()
+			targetProvider.Close()
+			return nil, nil, srcInfo, targetInfo, fmt.Errorf("table existence mismatch: source exists=%t, target exists=%t", srcInfo.TableExists, targetInfo.TableExists)
+		}
+		// If neither exists, it's handled later as a success case
+	}
+
+	// Check for column definition mismatch
+	if srcInfo.TableExists && targetInfo.TableExists && !equalStringSlices(srcInfo.Columns, targetInfo.Columns) {
+		srcProvider.Close()
+		targetProvider.Close()
+		return nil, nil, srcInfo, targetInfo, fmt.Errorf("column definition mismatch for table %s", v.TableName)
+	}
+
+	return srcProvider, targetProvider, srcInfo, targetInfo, nil
+}
+
+// calculatePartitions determines the partitions for checksumming based on source table info.
+func (v *UnifiedChecksumValidator) calculatePartitions(srcInfo *metadata.TableInfo) ([]metadata.Partition, error) {
+	// Ensure the partition calculator uses RowsPerBatch if intended, or adjust constructor call.
+	partitionCalculator, err := partition.NewPartitionCalculator(srcInfo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create partition calculator: %w", err)
+	}
+	// Assuming calculator internally uses RowsPerBatch or other logic to define partitions
+	partitions, err := partitionCalculator.CalculatePartitions()
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate partitions: %w", err)
+	}
+	fmt.Printf("Calculated %d partitions for table %s based on source 1.\n", len(partitions), v.TableName)
+	return partitions, nil
+}
+
+// processPartitionsConcurrently calculates checksums, compares, saves results, and returns summaries.
+func (v *UnifiedChecksumValidator) processPartitionsConcurrently(
+	srcProvider *metadata.DBConnProvider,
+	targetProvider *metadata.DBConnProvider,
+	srcInfo *metadata.TableInfo,
+	targetInfo *metadata.TableInfo,
+	partitions []metadata.Partition,
+) ([]PartitionComparisonSummary, error) {
+
+	var eg errgroup.Group
+	concurrencyLimit := runtime.NumCPU() * 2
+	if concurrencyLimit < 2 { concurrencyLimit = 2 }
+	if concurrencyLimit > 16 { concurrencyLimit = 16 }
+	eg.SetLimit(concurrencyLimit)
+	fmt.Printf("Processing %d partitions with concurrency limit %d...\n", len(partitions), concurrencyLimit)
+
+	resultsChan := make(chan PartitionComparisonSummary, len(partitions))
+	summaries := make([]PartitionComparisonSummary, 0, len(partitions))
+
+	srcDB := srcProvider.GetDbConn()
+	targetDB := targetProvider.GetDbConn()
+	columns := srcInfo.Columns
+
+	for _, p := range partitions {
+		part := p // Capture loop variable
+
+		eg.Go(func() error {
+			srcPcc := NewPartitionChecksumCalculator(&part)
+			targetPcc := NewPartitionChecksumCalculator(&part)
+
+			var srcChecksum, targetChecksum string
+			var srcRowCount, targetRowCount int64
+			var srcErr, targetErr error
+			var wgPart sync.WaitGroup
+			wgPart.Add(2)
+
+			go func() {
+				defer wgPart.Done()
+				srcChecksum, srcRowCount, srcErr = srcPcc.CalculateChecksum(srcDB, columns)
+			}()
+			go func() {
+				defer wgPart.Done()
+				targetChecksum, targetRowCount, targetErr = targetPcc.CalculateChecksum(targetDB, columns)
+			}()
+			wgPart.Wait()
+
+			checksumMatch, rowCountMatch, partitionOverallMatch := v.comparePartitionResults(part.Index, srcChecksum, targetChecksum, srcRowCount, targetRowCount, srcErr, targetErr)
+
+			v.savePartitionResultToDB(part.Index, srcChecksum, targetChecksum, srcRowCount, targetRowCount, checksumMatch, rowCountMatch, srcErr, targetErr)
+
+			resultsChan <- PartitionComparisonSummary{
+				Index:         part.Index,
+				Match:         partitionOverallMatch,
+				ChecksumMatch: checksumMatch,
+				RowCountMatch: rowCountMatch,
+				SourceErr:     srcErr,
+				TargetErr:     targetErr,
+			}
+			return nil
+		})
+	}
+
+	groupErr := eg.Wait()
+	close(resultsChan)
+
+	for summary := range resultsChan {
+		summaries = append(summaries, summary)
+	}
+	log.Printf("Processed results for %d partitions.", len(summaries))
+
+	// Return summaries and the critical error from the group
+	return summaries, groupErr
+}
+
+// comparePartitionResults performs the comparison logic for a single partition's results.
+func (v *UnifiedChecksumValidator) comparePartitionResults(partitionIndex int, srcChecksum, targetChecksum string, srcRowCount, targetRowCount int64, srcErr, targetErr error) (checksumMatch, rowCountMatch, overallMatch bool) {
+	checksumMatch = false
+	rowCountMatch = false
+	overallMatch = false
+
+	if srcErr == nil && targetErr == nil {
+		rowCountMatch = (srcRowCount == targetRowCount)
+		if rowCountMatch {
+			checksumMatch = (srcChecksum == targetChecksum)
+			if checksumMatch {
+				overallMatch = true
+			}
+		}
+		// Log mismatches immediately
+		if !rowCountMatch {
+			log.Printf("Partition %d: Row count mismatch (Src:%d, Tgt:%d)\n", partitionIndex, srcRowCount, targetRowCount)
+		} else if !checksumMatch {
+			log.Printf("Partition %d: Checksum mismatch (Src:%s, Tgt:%s)\n", partitionIndex, srcChecksum, targetChecksum)
+		}
+	} else {
+		log.Printf("Partition %d encountered errors: Src=%v, Target=%v\n", partitionIndex, srcErr, targetErr)
+	}
+	return checksumMatch, rowCountMatch, overallMatch
+}
+
+// savePartitionResultToDB saves the detailed partition results to the database if configured.
+func (v *UnifiedChecksumValidator) savePartitionResultToDB(partitionIndex int, srcChecksum, targetChecksum string, srcRowCount, targetRowCount int64, checksumMatch, rowCountMatch bool, srcErr, targetErr error) {
+	if v.dbStore != nil && v.jobID > 0 {
+		partitionData := storage.PartitionResultData{
+			JobID:          v.jobID,
+			PartitionIndex: partitionIndex,
+			SourceChecksum: srcChecksum,
+			TargetChecksum: targetChecksum,
+			SourceRowCount: srcRowCount,
+			TargetRowCount: targetRowCount,
+			ChecksumMatch:  checksumMatch,
+			RowCountMatch:  rowCountMatch,
+			SourceError:    errorToString(srcErr),
+			TargetError:    errorToString(targetErr),
+		}
+		dbErr := v.dbStore.SavePartitionResult(partitionData)
+		if dbErr != nil {
+			log.Printf("ERROR: Failed to save partition %d result for job %d: %v\n", partitionIndex, v.jobID, dbErr)
+		}
+	}
+}
+
+// aggregatePartitionResults processes summaries and updates the final comparison result.
+func (v *UnifiedChecksumValidator) aggregatePartitionResults(summaries []PartitionComparisonSummary, comparisonResult *CompareChecksumResults) {
+	mismatchedPartitionsMap := make(map[int]bool)
+
+	for _, summary := range summaries {
+		if !summary.Match {
 			comparisonResult.Match = false
-			comparisonResult.RowCountMismatch = true // Consider existence difference as a row count mismatch
-			// Provide more specific info about existence
-			return comparisonResult, fmt.Errorf("table existence mismatch: source1 exists=%t, source2 exists=%t", sourceTableInfo.TableExists, targetTableInfo.TableExists)
-		}
-		// If table doesn't exist on either, perhaps return success or a specific status
-		if !sourceTableInfo.TableExists {
-			fmt.Printf("Table %s does not exist on either source. Skipping validation.\n", v.TableName)
-			comparisonResult.Match = true // Or define a specific state for non-existent tables
-			return comparisonResult, nil
-		}
-	}
-
-	// Basic checks: Row counts and column definitions (optional but recommended)
-	comparisonResult.SrcTotalRows = sourceTableInfo.RowCount
-	comparisonResult.TargetTotalRows = targetTableInfo.RowCount
-	// Optional: Compare column list/order
-	if !equalStringSlices(sourceTableInfo.Columns, targetTableInfo.Columns) {
-		return nil, fmt.Errorf("column definition mismatch between sources for table %s", v.TableName)
-	}
-	// Ensure a PK exists if partitioning is intended
-	if v.NumPartitions > 1 && (sourceTableInfo.PrimaryKey == "" || targetTableInfo.PrimaryKey == "") {
-		return nil, fmt.Errorf("cannot use partitioning for table %s as primary key is missing on one or both sources", v.TableName)
-	}
-
-	// 2. Calculate Partitions (based on Source 1 metadata, assuming structure compatibility)
-	// Need a temporary DB connection for partition calculation
-	partitionCalculator, err := partition.NewPartitionCalculator(sourceTableInfo)
-	var partitions []metadata.Partition
-	if partitionCalculator != nil { // Only calculate if calculator created and partitions requested
-		partitions, err = partitionCalculator.CalculatePartitions()
-		if err != nil {
-			return nil, fmt.Errorf("failed to calculate partitions (source 1): %w", err)
-		}
-		fmt.Printf("Calculated %d partitions for table %s based on source 1.\n", len(partitions), v.TableName)
-	}
-
-	// 3. Calculate Checksums for Partitions on both sources concurrently
-	var results1, results2 map[int]PartitionChecksumResult
-	var checksumErr1, checksumErr2 error
-	var wgChecksum sync.WaitGroup
-	wgChecksum.Add(2)
-
-	go func() {
-		defer wgChecksum.Done()
-		results1, checksumErr1 = v.CalculateChecksumInPartitions(srcDbConnProvider.GetDbConn(), sourceTableInfo, partitions)
-	}()
-	go func() {
-		defer wgChecksum.Done()
-		// Use the *same* partition definitions derived from source 1
-		results2, checksumErr2 = v.CalculateChecksumInPartitions(targetDbConnProvider.GetDbConn(), targetTableInfo, partitions)
-	}()
-	wgChecksum.Wait()
-
-	if checksumErr1 != nil {
-		return nil, fmt.Errorf("error calculating checksums on source 1: %w", checksumErr1)
-	}
-	if checksumErr2 != nil {
-		return nil, fmt.Errorf("error calculating checksums on source 2: %w", checksumErr2)
-	}
-
-	// Check if number of results matches expected number of partitions
-	if len(results1) != len(partitions) || len(results2) != len(partitions) {
-		// This might indicate partial failures or inconsistencies
-		return nil, fmt.Errorf("partition result count mismatch: expected %d, source1 got %d, source2 got %d", len(partitions), len(results1), len(results2))
-	}
-
-	// 4. Compare Partition Checksums
-	comparisonResult.Match = true                 // Assume match until proven otherwise
-	mismatchedPartitionsMap := make(map[int]bool) // Track indices of mismatched partitions
-
-	for i := 1; i <= len(partitions); i++ { // Iterate based on expected partition indices
-		res1, ok1 := results1[i]
-		res2, ok2 := results2[i]
-
-		if !ok1 || !ok2 {
-			// Should not happen if previous checks passed, but handle defensively
-			fmt.Printf("Missing result for partition %d on source1 (%t) or source2 (%t)\n", i, ok1, ok2)
-			comparisonResult.Match = false
-			comparisonResult.MismatchPartitions = append(comparisonResult.MismatchPartitions, i)
-			mismatchedPartitionsMap[i] = true
-			continue
-		}
-
-		// Check for errors within partition results (though CalculateChecksumInPartitions should have returned error already)
-		if res1.Error != nil || res2.Error != nil {
-			fmt.Printf("Error encountered in partition %d: src1=%v, src2=%v\n", i, res1.Error, res2.Error)
-			comparisonResult.Match = false // Mark as mismatch if any partition had errors
-			comparisonResult.MismatchPartitions = append(comparisonResult.MismatchPartitions, i)
-			mismatchedPartitionsMap[i] = true
-			continue // Skip checksum comparison if error occurred
-		}
-
-		if res1.RowCount != res2.RowCount {
-			fmt.Printf("Partition %d row count mismatch: Source1=%d, Source2=%d\n", i, res1.RowCount, res2.RowCount)
-			comparisonResult.Match = false
-			comparisonResult.RowCountMismatch = true // Mark overall row count mismatch as well
-			comparisonResult.MismatchPartitions = append(comparisonResult.MismatchPartitions, i)
-			mismatchedPartitionsMap[i] = true
-		}
-		if res1.Checksum != res2.Checksum {
-			fmt.Printf("Partition %d checksum mismatch: Source1=%s, Source2=%s\n", i, res1.Checksum, res2.Checksum)
-			comparisonResult.Match = false
-			if !mismatchedPartitionsMap[i] { // Avoid duplicates if row count also mismatched
-				comparisonResult.MismatchPartitions = append(comparisonResult.MismatchPartitions, i)
-				mismatchedPartitionsMap[i] = true
+			mismatchedPartitionsMap[summary.Index] = true
+			if !summary.RowCountMatch && summary.SourceErr == nil && summary.TargetErr == nil {
+				comparisonResult.RowCountMismatch = true
+			}
+			if summary.SourceErr != nil && comparisonResult.SrcError == nil {
+				comparisonResult.SrcError = summary.SourceErr
+			}
+			if summary.TargetErr != nil && comparisonResult.TargetError == nil {
+				comparisonResult.TargetError = summary.TargetErr
 			}
 		}
 	}
 
-	// Also consider the initial row count check
-	if comparisonResult.RowCountMismatch {
+	// Populate MismatchPartitions list from the map
+	comparisonResult.MismatchPartitions = make([]int, 0, len(mismatchedPartitionsMap))
+	for idx := range mismatchedPartitionsMap {
+		comparisonResult.MismatchPartitions = append(comparisonResult.MismatchPartitions, idx)
+	}
+	sort.Ints(comparisonResult.MismatchPartitions)
+}
+
+// printFinalSummary prints the validation outcome to the console.
+func (v *UnifiedChecksumValidator) printFinalSummary(comparisonResult *CompareChecksumResults) {
+	if comparisonResult.Match {
+		fmt.Printf("Validation completed: Table %s checksums match.\n", v.TableName)
+	} else {
+		fmt.Printf("Validation completed: Table %s checksums DO NOT match.\n", v.TableName)
+		if comparisonResult.RowCountMismatch {
+			fmt.Printf("  Row count mismatch detected in one or more partitions.\n")
+		}
+		if len(comparisonResult.MismatchPartitions) > 0 {
+			fmt.Printf("  Mismatched/Errored partitions indices: %v\n", comparisonResult.MismatchPartitions)
+		}
+		if comparisonResult.SrcError != nil || comparisonResult.TargetError != nil {
+			fmt.Printf("  Errors occurred during partition processing: First Source Err=%v, First Target Err=%v\n", comparisonResult.SrcError, comparisonResult.TargetError)
+		}
+	}
+}
+
+// RunValidation performs the checksum validation and stores results in the DB if configured.
+func (v *UnifiedChecksumValidator) RunValidation() (finalResult *CompareChecksumResults, finalError error) {
+	fmt.Printf("Starting unified checksum validation for table %s...\n", v.TableName)
+
+	// Initialize result struct
+	comparisonResult := &CompareChecksumResults{
+		Match:            true, // Assume match initially
+		TargetFailedRows: make(map[interface{}]string),
+		MismatchPartitions: []int{}, // Initialize slice
+	}
+
+	// Defer the final status update
+	defer func() {
+		// The deferred call uses the final values of comparisonResult and finalError
+		v.updateJobStatus(comparisonResult, finalError)
+	}()
+
+	// 1. Create Job Record (ignore error for checksum logic, but log)
+	_ = v.createJobRecord()
+
+	// 2. Setup Connections & Metadata
+	srcProvider, targetProvider, srcInfo, targetInfo, err := v.setupConnectionsAndMetadata()
+	if err != nil {
+		// If setup fails, comparisonResult might be partially populated by setup function
+		// Need to ensure comparisonResult is updated correctly for early exit
+		if srcInfo != nil { comparisonResult.SrcTotalRows = srcInfo.RowCount }
+		if targetInfo != nil { comparisonResult.TargetTotalRows = targetInfo.RowCount }
+		comparisonResult.Match = false 
+		finalError = fmt.Errorf("setup failed: %w", err)
+		return comparisonResult, finalError // Return immediately on setup failure
+	}
+	defer srcProvider.Close()
+	defer targetProvider.Close()
+
+	// 3. Handle non-existent table case
+	if !srcInfo.TableExists {
+		fmt.Printf("Table %s does not exist on either source. Skipping validation.\n", v.TableName)
+		comparisonResult.Match = true
+		comparisonResult.SrcTotalRows = 0
+		comparisonResult.TargetTotalRows = 0
+		return comparisonResult, nil // Success, nothing to compare
+	}
+
+	// 4. Populate initial comparison results from metadata
+	comparisonResult.SrcTotalRows = srcInfo.RowCount
+	comparisonResult.TargetTotalRows = targetInfo.RowCount
+	if comparisonResult.SrcTotalRows != comparisonResult.TargetTotalRows {
+		fmt.Printf("Overall row count mismatch detected (from metadata): Source=%d, Target=%d\n", comparisonResult.SrcTotalRows, comparisonResult.TargetTotalRows)
+		comparisonResult.RowCountMismatch = true
 		comparisonResult.Match = false
 	}
 
-	// 5. If Mismatches Found, Perform Row-by-Row Verification for those partitions
-	// TODO
-
-	sort.Ints(comparisonResult.MismatchPartitions) // Sort for consistent output
-
-	if comparisonResult.Match {
-		fmt.Printf("Validation successful: Table %s checksums match.\n", v.TableName)
-	} else {
-		fmt.Printf("Validation failed for table %s.\n", v.TableName)
-		if comparisonResult.RowCountMismatch {
-			fmt.Printf("  Row count mismatch: Source1=%d, Source2=%d\n", comparisonResult.SrcTotalRows, comparisonResult.TargetTotalRows)
-		}
-		if len(comparisonResult.MismatchPartitions) > 0 {
-			fmt.Printf("  Mismatched partitions: %v\n", comparisonResult.MismatchPartitions)
-		}
-		if comparisonResult.SrcError != nil || comparisonResult.TargetError != nil {
-			fmt.Printf("  Errors occurred during validation: Source1=%v, Source2=%v\n", comparisonResult.SrcError, comparisonResult.TargetError)
-		}
+	// 5. Calculate Partitions
+	partitions, err := v.calculatePartitions(srcInfo)
+	if err != nil {
+		comparisonResult.Match = false
+		finalError = fmt.Errorf("partition calculation failed: %w", err)
+		return comparisonResult, finalError
 	}
 
-	return comparisonResult, nil // Return comparison result, error is nil unless setup failed catastrophically
+	// 6. Process Partitions if any exist
+	if len(partitions) > 0 {
+		partitionSummaries, groupErr := v.processPartitionsConcurrently(srcProvider, targetProvider, srcInfo, targetInfo, partitions)
+		
+		// Aggregate results from partition processing
+		v.aggregatePartitionResults(partitionSummaries, comparisonResult)
+
+		if groupErr != nil {
+			// A critical error occurred during concurrent processing
+			log.Printf("Critical error during partition processing: %v", groupErr)
+			comparisonResult.Match = false // Ensure mismatch on critical error
+			if finalError == nil { // Don't overwrite earlier errors
+				finalError = groupErr
+			}
+		}
+	} else {
+		fmt.Println("Table appears to be empty or has no partitions. Validation complete based on metadata row counts.")
+	}
+
+	// 7. Optional Row-by-Row verification (Placeholder)
+	// TODO: Implement if needed
+
+	// 8. Print Summary
+	v.printFinalSummary(comparisonResult)
+
+	// 9. Return results (defer handles DB update)
+	finalResult = comparisonResult
+	return finalResult, finalError
 }
 
 // Helper function to compare string slices
