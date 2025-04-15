@@ -3,8 +3,11 @@
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
+rm -rf ./output
+mkdir -pv ./output
+
 # Define the output binary name
-OUTPUT_BINARY="rds-checksum"
+OUTPUT_BINARY="./output/rds-checksum"
 
 # Define the main package path
 MAIN_PACKAGE="./cmd/checksum/main.go"
