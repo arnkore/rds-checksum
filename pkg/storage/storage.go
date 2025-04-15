@@ -76,13 +76,8 @@ func (s *Store) InitializeSchema() error {
 
 // CreateJob inserts a new job record and returns its ID.
 func (s *Store) CreateJob(tableName string, rowsPerBatch int) (int64, error) {
-	if s.db == nil {
-		return 0, fmt.Errorf("database connection is nil")
-	}
-	query := `INSERT INTO checksum_jobs (table_name, rows_per_batch, status, start_time)
-	          VALUES (?, ?, ?, ?)`
-	startTime := time.Now()
-	result, err := s.db.Exec(query, tableName, rowsPerBatch, "pending", startTime)
+	query := `INSERT INTO checksum_jobs (table_name, rows_per_batch, status, start_time) VALUES (?, ?, ?, ?)`
+	result, err := s.db.Exec(query, tableName, rowsPerBatch, "running", time.Now())
 	if err != nil {
 		return 0, fmt.Errorf("failed to insert new job: %w", err)
 	}
@@ -95,11 +90,8 @@ func (s *Store) CreateJob(tableName string, rowsPerBatch int) (int64, error) {
 
 // UpdateJobStatus updates the status and optionally an error message for a job.
 func (s *Store) UpdateJobStatus(jobID int64, status string, errorMessage string) error {
-	if s.db == nil {
-		return fmt.Errorf("database connection is nil")
-	}
 	var query string
-	var args []interface{}
+	var args []any
 
 	if errorMessage != "" {
 		query = `UPDATE checksum_jobs SET status = ?, error_message = ? WHERE job_id = ?`
@@ -135,16 +127,16 @@ func (s *Store) UpdateJobCompletion(jobID int64, status string, overallMatch boo
 
 // PartitionResultData holds data for a single partition result to be saved.
 type PartitionResultData struct {
-	JobID           int64
-	PartitionIndex  int
-	SourceChecksum  string
-	TargetChecksum  string
-	SourceRowCount  int64
-	TargetRowCount  int64
-	ChecksumMatch   bool
-	RowCountMatch   bool
-	SourceError     string
-	TargetError     string
+	JobID          int64
+	PartitionIndex int
+	SourceChecksum string
+	TargetChecksum string
+	SourceRowCount int64
+	TargetRowCount int64
+	ChecksumMatch  bool
+	RowCountMatch  bool
+	SourceError    string
+	TargetError    string
 }
 
 // SavePartitionResult inserts a result record for a specific partition.
@@ -173,4 +165,4 @@ func (s *Store) SavePartitionResult(data PartitionResultData) error {
 	return nil
 }
 
-// Add helper functions to convert potential errors to strings, handle NULLs etc. as needed. 
+// Add helper functions to convert potential errors to strings, handle NULLs etc. as needed.

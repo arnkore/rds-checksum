@@ -81,7 +81,7 @@ func TestUnifiedChecksumValidator_RunValidation(t *testing.T) {
 	configTarget := testConfig
 
 	// Helper to run validation and assert common expectations
-	runAndAssert := func(t *testing.T, validator *UnifiedChecksumValidator, expectMatch bool, expectRowCountMismatch bool, expectMismatchPartitions []int, expectFailedRows int) {
+	runAndAssert := func(t *testing.T, validator *ChecksumValidator, expectMatch bool, expectRowCountMismatch bool, expectMismatchPartitions []int, expectFailedRows int) {
 		t.Helper()
 		result, err := validator.RunValidation()
 		require.NoError(t, err, "RunValidation encountered an unexpected error")
@@ -99,13 +99,13 @@ func TestUnifiedChecksumValidator_RunValidation(t *testing.T) {
 	}
 
 	t.Run("Matching tables (1 partition)", func(t *testing.T) {
-		validator := NewUnifiedChecksumValidator(configSource, configTarget, "test_table", 1)
+		validator := NewChecksumValidator(configSource, configTarget, "test_table", 1)
 		runAndAssert(t, validator, true, false, []int{}, 0)
 	})
 
 	t.Run("Matching tables (multiple partitions)", func(t *testing.T) {
 		// Assuming test_table has enough rows (e.g., > 10) for multiple partitions
-		validator := NewUnifiedChecksumValidator(configSource, configTarget, "test_table", 3)
+		validator := NewChecksumValidator(configSource, configTarget, "test_table", 3)
 		runAndAssert(t, validator, true, false, []int{}, 0)
 	})
 

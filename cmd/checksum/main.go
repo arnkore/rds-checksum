@@ -32,8 +32,9 @@ type Options struct {
 	ResultPort     int    `long:"result-port" description:"Port for result database" required:"true"`
 	ResultDB       string `long:"result-db" description:"Database name for result database" required:"true"`
 
-	TableName    string `long:"table-name" description:"Name of the table to validate" required:"true"`
-	RowsPerBatch int    `long:"rows-per-batch" default:"100000" description:"Target number of rows to process in each batch/partition" required:"false"`
+	TableName       string `long:"table-name" description:"Name of the table to validate" required:"true"`
+	RowsPerBatch    int    `long:"rows-per-batch" default:"100000" description:"Target number of rows to process in each batch/partition" required:"false"`
+	ConcurrentLimit int    `long:"concurrent_limit" default:"10" description:"Number of tasks to concurrently processing" required:"false"`
 }
 
 // Function to construct DSN from parts
@@ -80,7 +81,7 @@ func main() {
 	// --- Create and run the validator ---
 	// The validator now needs the storage handler
 	fmt.Printf("Starting checksum validation for table '%s' with batches of approximately %d rows...\n", opts.TableName, opts.RowsPerBatch)
-	validator := checksum.NewUnifiedChecksumValidator(srcConfig, targetConfig, opts.TableName, opts.RowsPerBatch, dbStore)
+	validator := checksum.NewChecksumValidator(srcConfig, targetConfig, opts.TableName, opts.RowsPerBatch, opts.ConcurrentLimit, dbStore)
 	// RunValidation will now handle storing results if dbStore is not nil
 	result, runErr := validator.RunValidation()
 
