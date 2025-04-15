@@ -2,17 +2,39 @@ package main
 
 import (
 	"database/sql"
-	"flag"
 	"fmt"
-	"os"
-	"strings"
-
 	"github.com/arnkore/rds-checksum/pkg/checksum"
 	"github.com/arnkore/rds-checksum/pkg/metadata"
 	"github.com/arnkore/rds-checksum/pkg/storage" // Assuming storage package exists
+	"github.com/jessevdk/go-flags"
+	"os"
 
 	_ "github.com/go-sql-driver/mysql" // Assuming MySQL for results DB
 )
+
+type Options struct {
+	// --- Flags for Source DB ---
+	SourceUser     string `long:"source-user" description:"Username for source database" required:"true"`
+	SourcePassword string `long:"source-password" description:"Password for source database" required:"true"`
+	SourceHost     string `long:"source-host" description:"Hostname for source database" required:"true"`
+	SourcePort     int    `long:"source-port" description:"Port for source database" required:"true"`
+	SourceDB       string `long:"source-db" description:"Database name for source database" required:"true"`
+	// --- Flags for Target DB ---
+	TargetUser     string `long:"target-user" description:"Username for target database" required:"true"`
+	TargetPassword string `long:"target-password" description:"Password for target database" required:"true"`
+	TargetHost     string `long:"target-host" description:"Hostname for target database" required:"true"`
+	TargetPort     int    `long:"target-port" description:"Port for target database" required:"true"`
+	TargetDB       string `long:"target-db" description:"Database name for target database" required:"true"`
+	// --- Flags for Results DB ---
+	ResultUser     string `long:"result-user" description:"Username for result database" required:"true"`
+	ResultPassword string `long:"result-password" description:"Password for result database" required:"true"`
+	ResultHost     string `long:"result-host" description:"Hostname for result database" required:"true"`
+	ResultPort     int    `long:"result-port" description:"Port for result database" required:"true"`
+	ResultDB       string `long:"result-db" description:"Database name for result database" required:"true"`
+
+	TableName    string `long:"table-name" description:"Name of the table to validate" required:"true"`
+	RowsPerBatch int    `long:"rows-per-batch" default:"100000" description:"Target number of rows to process in each batch/partition" required:"false"`
+}
 
 // Function to construct DSN from parts
 func buildDSN(user, password, host string, port int, dbname string) string {
@@ -23,128 +45,42 @@ func buildDSN(user, password, host string, port int, dbname string) string {
 }
 
 func main() {
-	// --- Flags for Source DB ---
-	sourceUser := flag.String("source-user", "", "Username for source database")
-	sourcePassword := flag.String("source-password", "", "Password for source database")
-	sourceHost := flag.String("source-host", "", "Host or IP address for source database")
-	sourcePort := flag.Int("source-port", 3306, "Port number for source database")
-	sourceDB := flag.String("source-db", "", "Database name for source database")
-
-	// --- Flags for Target DB ---
-	targetUser := flag.String("target-user", "", "Username for target database")
-	targetPassword := flag.String("target-password", "", "Password for target database")
-	targetHost := flag.String("target-host", "", "Host or IP address for target database")
-	targetPort := flag.Int("target-port", 3306, "Port number for target database")
-	targetDB := flag.String("target-db", "", "Database name for target database")
-
-	// --- Flags for Results DB ---
-	resultsDBUser := flag.String("results-db-user", "", "Username for results database")
-	resultsDBPassword := flag.String("results-db-password", "", "Password for results database")
-	resultsDBHost := flag.String("results-db-host", "", "Host or IP address for results database")
-	resultsDBPort := flag.Int("results-db-port", 3306, "Port number for results database")
-	resultsDBName := flag.String("results-db-name", "", "Database name for results database")
-	initializeSchema := flag.Bool("initialize-schema", false, "If set, try to create necessary tables in results DB")
-
-	// --- Common flags ---
-	tableName := flag.String("table", "", "Name of the table to validate")
-	rowsPerBatch := flag.Int("rows-per-batch", 1000, "Target number of rows to process in each batch/partition")
-
-	flag.Parse()
-
-	// --- Validate required flags ---
-	missingFlags := []string{}
-	if *sourceUser == "" {
-		missingFlags = append(missingFlags, "--source-user")
-	}
-	if *sourceHost == "" {
-		missingFlags = append(missingFlags, "--source-host")
-	}
-	if *sourceDB == "" {
-		missingFlags = append(missingFlags, "--source-db")
-	}
-	if *targetUser == "" {
-		missingFlags = append(missingFlags, "--target-user")
-	}
-	if *targetHost == "" {
-		missingFlags = append(missingFlags, "--target-host")
-	}
-	if *targetDB == "" {
-		missingFlags = append(missingFlags, "--target-db")
-	}
-	if *tableName == "" {
-		missingFlags = append(missingFlags, "--table")
-	}
-	// Validate results DB flags if specified
-	if *resultsDBHost != "" || *resultsDBName != "" { // If using results db, need host and name
-		if *resultsDBHost == "" {
-			missingFlags = append(missingFlags, "--results-db-host")
-		}
-		if *resultsDBName == "" {
-			missingFlags = append(missingFlags, "--results-db-name")
-		}
-		// User/Pass might be optional depending on DB setup
-	}
-
-	if len(missingFlags) > 0 {
-		fmt.Fprintf(os.Stderr, "Error: Missing required flags: %s\n", strings.Join(missingFlags, ", "))
-		flag.Usage()
-		os.Exit(1)
-	}
-
-	if *rowsPerBatch <= 0 {
-		fmt.Fprintln(os.Stderr, "Error: --rows-per-batch must be a positive integer.")
+	var opts Options
+	parser := flags.NewParser(&opts, flags.Default)
+	_, err := parser.Parse()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
 	// --- Connect to Results DB ---
 	var resultsDB *sql.DB
 	var dbStore *storage.Store
-	var err error
-	if *resultsDBHost != "" { // Only connect if results DB host is provided
-		resultsDSN := buildDSN(*resultsDBUser, *resultsDBPassword, *resultsDBHost, *resultsDBPort, *resultsDBName)
-		fmt.Printf("Connecting to results database: %s@%s:%d/%s\n", *resultsDBUser, *resultsDBHost, *resultsDBPort, *resultsDBName)
-		resultsDB, err = sql.Open("mysql", resultsDSN) // Assuming mysql driver
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error connecting to results database: %v\n", err)
-			os.Exit(1)
-		}
-		defer resultsDB.Close()
-
-		err = resultsDB.Ping()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error pinging results database: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println("Successfully connected to results database.")
-
-		dbStore = storage.NewStore(resultsDB)
-
-		// Optionally initialize schema
-		if *initializeSchema {
-			fmt.Println("Initializing database schema...")
-			err = dbStore.InitializeSchema()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error initializing schema: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Println("Schema initialization attempted.")
-		}
-	} else {
-		fmt.Println("Results database not configured. Results will only be printed to console.")
+	resultsDSN := buildDSN(opts.ResultUser, opts.ResultPassword, opts.ResultHost, opts.ResultPort, opts.ResultDB)
+	resultsDB, err = sql.Open("mysql", resultsDSN) // Assuming mysql driver
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error connecting to results database: %v\n", err)
+		os.Exit(1)
 	}
+	defer resultsDB.Close()
+
+	err = resultsDB.Ping()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error pinging results database: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Successfully connected to results database.")
+
+	dbStore = storage.NewStore(resultsDB)
 
 	// --- Prepare Source/Target Config ---
-	srcConfig := metadata.NewConfig(*sourceHost, *sourcePort, *sourceUser, *sourcePassword, *sourceDB)
-	targetConfig := metadata.NewConfig(*targetHost, *targetPort, *targetUser, *targetPassword, *targetDB)
+	srcConfig := metadata.NewConfig(opts.SourceHost, opts.SourcePort, opts.SourceUser, opts.SourcePassword, opts.SourceDB)
+	targetConfig := metadata.NewConfig(opts.TargetUser, opts.TargetPort, opts.TargetUser, opts.TargetPassword, opts.TargetDB)
 
 	// --- Create and run the validator ---
 	// The validator now needs the storage handler
-	validator := checksum.NewUnifiedChecksumValidator(srcConfig, targetConfig, *tableName, *rowsPerBatch, dbStore)
-
-	fmt.Printf("Starting checksum validation for table '%s' with batches of approximately %d rows...\n", *tableName, *rowsPerBatch)
-	fmt.Printf("Source: %s@%s:%d/%s\n", *sourceUser, *sourceHost, *sourcePort, *sourceDB)
-	fmt.Printf("Target: %s@%s:%d/%s\n", *targetUser, *targetHost, *targetPort, *targetDB)
-
+	fmt.Printf("Starting checksum validation for table '%s' with batches of approximately %d rows...\n", opts.TableName, opts.RowsPerBatch)
+	validator := checksum.NewUnifiedChecksumValidator(srcConfig, targetConfig, opts.TableName, opts.RowsPerBatch, dbStore)
 	// RunValidation will now handle storing results if dbStore is not nil
 	result, runErr := validator.RunValidation()
 
@@ -161,6 +97,10 @@ func main() {
 	}
 
 	// If we reached here, RunValidation completed its process (though checksums might mismatch)
+	HandleChecksumResult(jobID, result)
+}
+
+func HandleChecksumResult(jobID int64, result *checksum.CompareChecksumResults) {
 	if jobID > 0 {
 		fmt.Printf("Validation process completed for Job ID: %d", jobID)
 		if result.Match {
