@@ -7,17 +7,19 @@ import (
 
 // PartitionCalculator determines how to divide a table into partitions.
 type PartitionCalculator struct {
-	TableInfo *metadata.TableInfo
+	TableInfo    *metadata.TableInfo
+	RowsPerBatch int
 }
 
 // NewPartitionCalculator creates a new PartitionCalculator.
-func NewPartitionCalculator(tableInfo *metadata.TableInfo) (*PartitionCalculator, error) {
+func NewPartitionCalculator(tableInfo *metadata.TableInfo, rowsPerBatch int) (*PartitionCalculator, error) {
 	if tableInfo.PrimaryKey == "" {
 		return nil, fmt.Errorf("cannot partition table %s without a primary key", tableInfo.TableName)
 	}
 	// Further checks could be added here, e.g., ensuring PK is numeric for range partitioning.
 	return &PartitionCalculator{
-		TableInfo: tableInfo,
+		TableInfo:    tableInfo,
+		RowsPerBatch: rowsPerBatch,
 	}, nil
 }
 
@@ -25,30 +27,20 @@ func NewPartitionCalculator(tableInfo *metadata.TableInfo) (*PartitionCalculator
 // This is a simplified example assuming a numeric, auto-incrementing PK.
 // A more robust implementation would handle different PK types and distributions.
 func (pc *PartitionCalculator) CalculatePartitions() ([]metadata.Partition, error) {
-	if pc.TableInfo.RowCount == 0 {
+	tablePKRange := pc.TableInfo.PKRange
+	totalRange := tablePKRange.GetTotalRange()
+	if totalRange == 0 || pc.TableInfo.RowCount == 0 {
 		return []metadata.Partition{}, nil // No rows, no partitions needed
 	}
 
-	tablePKRange := pc.TableInfo.PKRange
-	var numPartitions int
+	var numPartitions = int(totalRange / int64(pc.RowsPerBatch))
 	partitions := make([]metadata.Partition, 0, numPartitions)
-	totalRange := tablePKRange.GetTotalRange()
-	// Avoid division by zero if numPartitions is 1 and range is 0 (single row table)
-	if totalRange == 0 && numPartitions > 0 { // Single distinct PK value
-		partitions = append(partitions, metadata.Partition{Index: 1, PKRange: tablePKRange})
-		return partitions, nil
-	}
-	// Ensure partitionSize is at least 1
-	partitionSize := totalRange / int64(numPartitions)
-	if partitionSize == 0 && totalRange > 0 {
-		partitionSize = 1 // Handle case where range < numPartitions
-	}
-
 	currentStart := tablePKRange.GetStart()
 	for i := 0; i < numPartitions; i++ {
-		currentEnd := currentStart + partitionSize - 1
+		currentEnd := currentStart + int64(pc.RowsPerBatch) - 1
 		if i == numPartitions-1 || currentEnd >= tablePKRange.GetEnd() {
-			currentEnd = tablePKRange.GetEnd() // Ensure the last partition includes the max PK
+			// Ensure the last partition includes the max PK
+			currentEnd = tablePKRange.GetEnd()
 		}
 
 		// Add partition only if start <= end. This handles edge cases.
@@ -74,8 +66,6 @@ func (pc *PartitionCalculator) CalculatePartitions() ([]metadata.Partition, erro
 		if lastPK := lastPartition.PKRange.GetEnd(); lastPK != tablePKRange.GetEnd() {
 			// This might indicate a logic error or edge case not handled
 			fmt.Printf("Warning: Last partition end PK %d does not match max PK %d for table %s\n", lastPK, tablePKRange.GetEnd(), pc.TableInfo.TableName)
-			// Optionally adjust the last partition's EndPK here if necessary
-			// partitions[len(partitions)-1].EndPK = maxPK
 		}
 	} else if pc.TableInfo.RowCount > 0 {
 		// If we have rows but generated no partitions, something is wrong

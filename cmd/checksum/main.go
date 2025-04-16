@@ -1,7 +1,6 @@
 package main
 
 import (
-	"database/sql"
 	"fmt"
 	"github.com/arnkore/rds-checksum/pkg/checksum"
 	"github.com/arnkore/rds-checksum/pkg/metadata"
@@ -37,14 +36,6 @@ type Options struct {
 	ConcurrentLimit int    `long:"concurrent_limit" default:"10" description:"Number of tasks to concurrently processing" required:"false"`
 }
 
-// Function to construct DSN from parts
-func buildDSN(user, password, host string, port int, dbname string) string {
-	// Format: username:password@protocol(address)/dbname?param=value
-	// Ensure necessary parameters for the driver (e.g., parseTime)
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local",
-		user, password, host, port, dbname)
-}
-
 func main() {
 	var opts Options
 	parser := flags.NewParser(&opts, flags.Default)
@@ -55,34 +46,25 @@ func main() {
 	}
 
 	// --- Connect to Results DB ---
-	var resultsDB *sql.DB
-	var dbStore *storage.Store
-	resultsDSN := buildDSN(opts.ResultUser, opts.ResultPassword, opts.ResultHost, opts.ResultPort, opts.ResultDB)
-	resultsDB, err = sql.Open("mysql", resultsDSN) // Assuming mysql driver
+	var resultConfig = &metadata.Config{
+		Host:     opts.ResultHost,
+		Port:     opts.ResultPort,
+		User:     opts.ResultUser,
+		Password: opts.ResultPassword,
+		Database: opts.ResultDB,
+	}
+	resultDbConnProvider := metadata.NewDBConnProvider(resultConfig)
+	resultsDB, err := resultDbConnProvider.CreateDbConn()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error connecting to results database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error connecting to metadata database: %v\n", err)
 		os.Exit(1)
 	}
-	defer resultsDB.Close()
-
-	err = resultsDB.Ping()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error pinging results database: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println("Successfully connected to results database.")
-
-	dbStore = storage.NewStore(resultsDB)
-
-	// --- Prepare Source/Target Config ---
-	srcConfig := metadata.NewConfig(opts.SourceHost, opts.SourcePort, opts.SourceUser, opts.SourcePassword, opts.SourceDB)
-	targetConfig := metadata.NewConfig(opts.TargetUser, opts.TargetPort, opts.TargetUser, opts.TargetPassword, opts.TargetDB)
+	dbStore := storage.NewStore(resultsDB)
 
 	// --- Create and run the validator ---
-	// The validator now needs the storage handler
-	fmt.Printf("Starting checksum validation for table '%s' with batches of approximately %d rows...\n", opts.TableName, opts.RowsPerBatch)
+	srcConfig := metadata.NewConfig(opts.SourceHost, opts.SourcePort, opts.SourceUser, opts.SourcePassword, opts.SourceDB)
+	targetConfig := metadata.NewConfig(opts.TargetHost, opts.TargetPort, opts.TargetUser, opts.TargetPassword, opts.TargetDB)
 	validator := checksum.NewChecksumValidator(srcConfig, targetConfig, opts.TableName, opts.RowsPerBatch, opts.ConcurrentLimit, dbStore)
-	// RunValidation will now handle storing results if dbStore is not nil
 	result, runErr := validator.RunValidation()
 
 	// --- Handle Results ---

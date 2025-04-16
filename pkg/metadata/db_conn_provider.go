@@ -7,13 +7,18 @@ import (
 
 type DbConnProvider struct {
 	databaseName string
-	dbConn       *sql.DB
+	dsn          string
 }
 
 // NewDBConnProvider creates a new DbConnProvider.
-func NewDBConnProvider(config *Config) (*DbConnProvider, error) {
+func NewDBConnProvider(config *Config) *DbConnProvider {
 	dsn := config.GenerateDSN()
-	db, err := sql.Open("mysql", dsn)
+	return &DbConnProvider{databaseName: config.Database, dsn: dsn}
+}
+
+// CreateDbConn creates a new connection
+func (p *DbConnProvider) CreateDbConn() (*sql.DB, error) {
+	db, err := sql.Open("mysql", p.dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database connection: %w", err)
 	}
@@ -21,17 +26,13 @@ func NewDBConnProvider(config *Config) (*DbConnProvider, error) {
 		db.Close()
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
-	return &DbConnProvider{databaseName: config.Database, dbConn: db}, nil
+	return db, nil
 }
 
 // Close closes the database connection.
-func (p *DbConnProvider) Close() error {
-	if p.dbConn != nil {
-		return p.dbConn.Close()
+func (p *DbConnProvider) Close(db *sql.DB) error {
+	if db != nil {
+		return db.Close()
 	}
 	return nil
-}
-
-func (p *DbConnProvider) GetDbConn() *sql.DB {
-	return p.dbConn
 }

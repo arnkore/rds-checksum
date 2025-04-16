@@ -40,7 +40,7 @@ func (p *PKRange) GetEnd() int64 {
 }
 
 func (p *PKRange) GetTotalRange() int64 {
-	return p.EndPK - p.StartPK + 1
+	return p.EndPK - p.StartPK
 }
 
 func (p *PKRange) String() string {

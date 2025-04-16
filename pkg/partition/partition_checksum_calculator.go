@@ -1,4 +1,4 @@
-package checksum
+package partition
 
 import (
 	"crypto/sha256"
@@ -33,10 +33,11 @@ func (p *PartitionChecksumCalculator) CalculateChecksum(dbConn *sql.DB, columns 
 
 	partitionHasher := sha256.New()
 	var rowCount int64 = 0
+	var pkVal int64 = 0
 	var concatenatedColumns string
 
 	for rows.Next() {
-		if err := rows.Scan(&concatenatedColumns); err != nil {
+		if err := rows.Scan(&pkVal, &concatenatedColumns); err != nil {
 			return "", 0, fmt.Errorf("partition %d: failed to scan row: %w", p.Partition.Index, err)
 		}
 		partitionHasher.Write([]byte(concatenatedColumns)) // Combine row hashes

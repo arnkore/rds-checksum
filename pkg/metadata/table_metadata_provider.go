@@ -8,19 +8,20 @@ import (
 // TableMetaProvider handles fetching table metadata
 type TableMetaProvider struct {
 	DbProvider     *DbConnProvider
+	DatabaseName   string
 	TableName      string
 	TableInfoCache *TableInfo
 }
 
 // NewTableMetaProvider creates a new TableMetaProvider.
-func NewTableMetaProvider(dbProvider *DbConnProvider, tableName string) *TableMetaProvider {
-	return &TableMetaProvider{DbProvider: dbProvider, TableName: tableName}
+func NewTableMetaProvider(dbProvider *DbConnProvider, databaseName, tableName string) *TableMetaProvider {
+	return &TableMetaProvider{DbProvider: dbProvider, DatabaseName: databaseName, TableName: tableName}
 }
 
 // verifyTableExists checks if the specified table exists in the database
-func (p *TableMetaProvider) verifyTableExists(tableName string) (bool, error) {
+func (p *TableMetaProvider) verifyTableExists(dbConn *sql.DB, tableName string) (bool, error) {
 	var count int
-	err := p.getDbConn().QueryRow("SELECT COUNT(1) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+	err := dbConn.QueryRow("SELECT COUNT(1) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
 		p.GetDatabaseName(), tableName).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("failed to check table existence: %v", err)
@@ -32,9 +33,9 @@ func (p *TableMetaProvider) verifyTableExists(tableName string) (bool, error) {
 }
 
 // getTableRowCount retrieves the total number of rows in the table
-func (p *TableMetaProvider) getTableRowCount(tableName string) (int64, error) {
+func (p *TableMetaProvider) getTableRowCount(dbConn *sql.DB, tableName string) (int64, error) {
 	var totalRows int64
-	err := p.getDbConn().QueryRow(fmt.Sprintf("SELECT COUNT(1) FROM %s", tableName)).Scan(&totalRows)
+	err := dbConn.QueryRow(fmt.Sprintf("SELECT COUNT(1) FROM %s", tableName)).Scan(&totalRows)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get total row count: %v", err)
 	}
@@ -42,8 +43,8 @@ func (p *TableMetaProvider) getTableRowCount(tableName string) (int64, error) {
 }
 
 // getTableColumns retrieves all column names for the table
-func (p *TableMetaProvider) getTableColumns(tableName string) ([]string, error) {
-	rows, err := p.getDbConn().Query(`
+func (p *TableMetaProvider) getTableColumns(dbConn *sql.DB, tableName string) ([]string, error) {
+	rows, err := dbConn.Query(`
 		SELECT column_name 
 		FROM information_schema.columns 
 		WHERE table_schema = ? 
@@ -72,10 +73,10 @@ func (p *TableMetaProvider) getTableColumns(tableName string) ([]string, error) 
 }
 
 // getPrimaryKeyInfo retrieves primary key column and its min/max values
-func (p *TableMetaProvider) getPrimaryKeyInfo(tableName string) (string, error) {
+func (p *TableMetaProvider) getPrimaryKeyInfo(dbConn *sql.DB, tableName string) (string, error) {
 	// Get primary key column name
 	var pkColumn string
-	err := p.getDbConn().QueryRow("SELECT column_name FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_key = 'PRI'",
+	err := dbConn.QueryRow("SELECT column_name FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_key = 'PRI'",
 		p.GetDatabaseName(), tableName).Scan(&pkColumn)
 	if err != nil {
 		return "", fmt.Errorf("failed to get primary key column: %v", err)
@@ -84,10 +85,10 @@ func (p *TableMetaProvider) getPrimaryKeyInfo(tableName string) (string, error) 
 	return pkColumn, nil
 }
 
-func (p *TableMetaProvider) queryTablePKRange(primaryKey string, tableName string) (*PKRange, error) {
+func (p *TableMetaProvider) queryTablePKRange(dbConn *sql.DB, primaryKey string, tableName string) (*PKRange, error) {
 	var minPK, maxPK int64
 	queryMinMax := fmt.Sprintf("SELECT MIN(%s), MAX(%s) FROM %s", primaryKey, primaryKey, tableName)
-	err := p.getDbConn().QueryRow(queryMinMax).Scan(&minPK, &maxPK)
+	err := dbConn.QueryRow(queryMinMax).Scan(&minPK, &maxPK)
 	if err != nil {
 		// Handle cases like empty table (though checked earlier) or non-numeric PK if assumption is wrong
 		if err == sql.ErrNoRows {
@@ -96,7 +97,7 @@ func (p *TableMetaProvider) queryTablePKRange(primaryKey string, tableName strin
 		// A simple scan might fail if MIN/MAX return NULL (empty table) or non-integer types.
 		// Need more robust scanning if PK isn't guaranteed to be non-null integer.
 		var minPKNullable, maxPKNullable sql.NullInt64
-		errRetry := p.getDbConn().QueryRow(queryMinMax).Scan(&minPKNullable, &maxPKNullable)
+		errRetry := dbConn.QueryRow(queryMinMax).Scan(&minPKNullable, &maxPKNullable)
 		if errRetry != nil {
 			return EmptyPKRange, fmt.Errorf("failed to query min/max primary key for %s: %w", tableName, errRetry)
 		}
@@ -116,34 +117,36 @@ func (p *TableMetaProvider) queryTablePKRange(primaryKey string, tableName strin
 	return NewPKRange(minPK, maxPK), nil
 }
 
-// queryTableInfo retrieves table information by coordinating multiple operations
-func (p *TableMetaProvider) queryTableInfo(tableName string) (*TableInfo, error) {
+// QueryTableInfo retrieves table information by coordinating multiple operations
+func (p *TableMetaProvider) QueryTableInfo(tableName string) (*TableInfo, error) {
+	dbConn, err := p.DbProvider.CreateDbConn()
+	defer p.DbProvider.Close(dbConn)
 	// First verify table exists
-	exists, err := p.verifyTableExists(tableName)
+	exists, err := p.verifyTableExists(dbConn, tableName)
 	if err != nil {
 		return nil, err
 	}
 
 	// Get row count
-	rowCount, err := p.getTableRowCount(tableName)
+	rowCount, err := p.getTableRowCount(dbConn, tableName)
 	if err != nil {
 		return nil, err
 	}
 
 	// Get columns
-	columns, err := p.getTableColumns(tableName)
+	columns, err := p.getTableColumns(dbConn, tableName)
 	if err != nil {
 		return nil, err
 	}
 
 	// Get primary key information
-	pkColumn, err := p.getPrimaryKeyInfo(tableName)
+	pkColumn, err := p.getPrimaryKeyInfo(dbConn, tableName)
 	if err != nil {
 		return nil, err
 	}
 
 	// Get table pk range info
-	pkRange, err := p.queryTablePKRange(pkColumn, tableName)
+	pkRange, err := p.queryTablePKRange(dbConn, pkColumn, tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -159,19 +162,6 @@ func (p *TableMetaProvider) queryTableInfo(tableName string) (*TableInfo, error)
 	}, nil
 }
 
-// GetTableInfo retrieves table information by coordinating multiple operations
-func (p *TableMetaProvider) GetTableInfo(tableName string) (*TableInfo, error) {
-	if p.TableInfoCache != nil {
-		return p.TableInfoCache, nil
-	} else {
-		return p.queryTableInfo(tableName)
-	}
-}
-
-func (p *TableMetaProvider) getDbConn() *sql.DB {
-	return p.DbProvider.GetDbConn()
-}
-
 func (p *TableMetaProvider) GetDatabaseName() string {
-	return p.DbProvider.databaseName
+	return p.DatabaseName
 }

@@ -25,12 +25,13 @@ func (s *TableMetaProviderTestSuite) SetupTest() {
 	var err error
 	s.db, s.mock, err = sqlmock.New()
 	require.NoError(s.T(), err)
+	databaseName := "test"
 
 	s.dbProvider = &DbConnProvider{
 		dbConn:       s.db,
-		databaseName: "test",
+		databaseName: databaseName,
 	}
-	s.provider = NewTableMetaProvider(s.dbProvider, "test_table")
+	s.provider = NewTableMetaProvider(s.dbProvider, databaseName, "test_table")
 }
 
 // TearDownTest cleans up the test environment after each test

@@ -150,23 +150,23 @@ func (v *ChecksumValidator) createJobRecord() error {
 }
 
 // setupMetadata establishes DB connections, fetches metadata, and performs initial checks.
-func (v *ChecksumValidator) setupMetadata(srcProvider, targetProvider *metadata.DbConnProvider) (*metadata.TableInfo, *metadata.TableInfo, error) {
+func (v *ChecksumValidator) setupMetadata(srcConnProvider, targetConnProvider *metadata.DbConnProvider) (*metadata.TableInfo, *metadata.TableInfo, error) {
 	var srcInfo, targetInfo *metadata.TableInfo
 	var srcMetaErr, targetMetaErr error
 	// Get metadata concurrently
-	var wgMeta sync.WaitGroup
-	wgMeta.Add(2)
+	var metaWg sync.WaitGroup
+	metaWg.Add(2)
 	go func() {
-		defer wgMeta.Done()
-		srcMetaProvider := metadata.NewTableMetaProvider(srcProvider, v.TableName)
-		srcInfo, srcMetaErr = srcMetaProvider.GetTableInfo(v.TableName)
+		defer metaWg.Done()
+		srcMetaProvider := metadata.NewTableMetaProvider(srcConnProvider, v.SrcConfig.Database, v.TableName)
+		srcInfo, srcMetaErr = srcMetaProvider.QueryTableInfo(v.TableName)
 	}()
 	go func() {
-		defer wgMeta.Done()
-		targetMetaProvider := metadata.NewTableMetaProvider(targetProvider, v.TableName)
-		targetInfo, targetMetaErr = targetMetaProvider.GetTableInfo(v.TableName)
+		defer metaWg.Done()
+		targetMetaProvider := metadata.NewTableMetaProvider(targetConnProvider, v.TargetConfig.Database, v.TableName)
+		targetInfo, targetMetaErr = targetMetaProvider.QueryTableInfo(v.TableName)
 	}()
-	wgMeta.Wait()
+	metaWg.Wait()
 
 	if srcMetaErr != nil {
 		return nil, nil, fmt.Errorf("failed to setup metadata for table '%s': %v", v.TableName, srcMetaErr)
@@ -191,7 +191,7 @@ func (v *ChecksumValidator) setupMetadata(srcProvider, targetProvider *metadata.
 // calculatePartitions determines the partitions for checksumming based on source table info.
 func (v *ChecksumValidator) calculatePartitions(srcInfo *metadata.TableInfo) ([]metadata.Partition, error) {
 	// Ensure the partition calculator uses RowsPerBatch if intended, or adjust constructor call.
-	partitionCalculator, err := partition.NewPartitionCalculator(srcInfo)
+	partitionCalculator, err := partition.NewPartitionCalculator(srcInfo, v.RowsPerBatch)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create partition calculator: %w", err)
 	}
@@ -211,7 +211,8 @@ func (v *ChecksumValidator) processPartitionsConcurrently(srcInfo *metadata.Tabl
 	resultsChan := make(chan PartitionComparisonSummary, len(partitions))
 	summaries := make([]PartitionComparisonSummary, 0, len(partitions))
 	columns := srcInfo.Columns
-	fmt.Printf("Processing %d partitions with concurrency limit %d...\n", len(partitions), v.concurrency)
+	srcProvider := metadata.NewDBConnProvider(v.SrcConfig)
+	targetProvider := metadata.NewDBConnProvider(v.TargetConfig)
 
 	for _, p := range partitions {
 		part := p // Capture loop variable
@@ -225,19 +226,17 @@ func (v *ChecksumValidator) processPartitionsConcurrently(srcInfo *metadata.Tabl
 
 			go func() {
 				defer wgPart.Done()
-				srcProvider, _ := metadata.NewDBConnProvider(v.SrcConfig)
-				defer srcProvider.Close()
-				srcDB := srcProvider.GetDbConn()
-				srcPcc := NewPartitionChecksumCalculator(&part)
-				srcChecksum, srcRowCount, srcErr = srcPcc.CalculateChecksum(srcDB, columns)
+				srcDbConn, _ := srcProvider.CreateDbConn()
+				defer srcProvider.Close(srcDbConn)
+				srcPcc := partition.NewPartitionChecksumCalculator(&part)
+				srcChecksum, srcRowCount, srcErr = srcPcc.CalculateChecksum(srcDbConn, columns)
 			}()
 			go func() {
 				defer wgPart.Done()
-				targetProvider, _ := metadata.NewDBConnProvider(v.TargetConfig)
-				defer targetProvider.Close()
-				targetDB := targetProvider.GetDbConn()
-				targetPcc := NewPartitionChecksumCalculator(&part)
-				targetChecksum, targetRowCount, targetErr = targetPcc.CalculateChecksum(targetDB, columns)
+				targetDbConn, _ := targetProvider.CreateDbConn()
+				defer targetProvider.Close(targetDbConn)
+				targetPcc := partition.NewPartitionChecksumCalculator(&part)
+				targetChecksum, targetRowCount, targetErr = targetPcc.CalculateChecksum(targetDbConn, columns)
 			}()
 			wgPart.Wait()
 
@@ -354,7 +353,7 @@ func (v *ChecksumValidator) printFinalSummary(comparisonResult *CompareChecksumR
 
 // RunValidation performs the checksum validation and stores results in the DB if configured.
 func (v *ChecksumValidator) RunValidation() (finalResult *CompareChecksumResults, finalError error) {
-	fmt.Printf("Starting checksum for table %s...\n", v.TableName)
+	fmt.Printf("Starting checksum job for table '%s' with batches of approximately %d rows...\n", v.TableName, v.RowsPerBatch)
 
 	// Initialize result struct
 	comparisonResult := &CompareChecksumResults{
@@ -373,9 +372,9 @@ func (v *ChecksumValidator) RunValidation() (finalResult *CompareChecksumResults
 	_ = v.createJobRecord()
 
 	// 2. Setup Connections & Metadata
-	srcProvider, _ := metadata.NewDBConnProvider(v.SrcConfig)
-	targetProvider, _ := metadata.NewDBConnProvider(v.TargetConfig)
-	srcInfo, targetInfo, err := v.setupMetadata(srcProvider, targetProvider)
+	srcConnProvider := metadata.NewDBConnProvider(v.SrcConfig)
+	targetConnProvider := metadata.NewDBConnProvider(v.TargetConfig)
+	srcInfo, targetInfo, err := v.setupMetadata(srcConnProvider, targetConnProvider)
 	if err != nil {
 		// If setup fails, comparisonResult might be partially populated by setup function
 		// Need to ensure comparisonResult is updated correctly for early exit
@@ -389,8 +388,6 @@ func (v *ChecksumValidator) RunValidation() (finalResult *CompareChecksumResults
 		finalError = fmt.Errorf("setup failed: %w", err)
 		return comparisonResult, finalError // Return immediately on setup failure
 	}
-	defer srcProvider.Close()
-	defer targetProvider.Close()
 
 	// 3. Handle non-existent table case
 	if !srcInfo.TableExists || !targetInfo.TableExists {
