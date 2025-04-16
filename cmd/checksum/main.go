@@ -32,7 +32,7 @@ type Options struct {
 	ResultDB       string `long:"result-db" description:"Database name for result database" required:"true"`
 
 	TableName       string `long:"table-name" description:"Name of the table to validate" required:"true"`
-	RowsPerBatch    int    `long:"rows-per-batch" default:"100000" description:"Target number of rows to process in each batch/partition" required:"false"`
+	RowsPerBatch    int    `long:"rows-per-batch" default:"100000" description:"Target number of rows to process in each batch/batch" required:"false"`
 	ConcurrentLimit int    `long:"concurrent_limit" default:"10" description:"Number of tasks to concurrently processing" required:"false"`
 }
 
@@ -112,8 +112,8 @@ func HandleChecksumResult(jobID int64, result *checksum.CompareChecksumResults) 
 			if result.RowCountMismatch {
 				fmt.Printf("   Row count mismatch: Source=%d, Target=%d\n", result.SrcTotalRows, result.TargetTotalRows)
 			}
-			if len(result.MismatchPartitions) > 0 {
-				fmt.Printf("   Mismatched partitions indices: %v\n", result.MismatchPartitions)
+			if len(result.MismatchBatches) > 0 {
+				fmt.Printf("   Mismatched batches indices: %v\n", result.MismatchBatches)
 			}
 			if result.SrcError != nil || result.TargetError != nil {
 				fmt.Printf("   Errors during processing: Source Err=%v, Target Err=%v\n", result.SrcError, result.TargetError)

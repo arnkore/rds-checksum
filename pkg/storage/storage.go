@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS checksum_jobs (
     overall_match BOOLEAN NULL,
     source_total_rows BIGINT NULL,
     target_total_rows BIGINT NULL,
-    mismatched_partitions_count INT DEFAULT 0,
+    mismatched_batch_count INT DEFAULT 0,
     start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     end_time TIMESTAMP NULL,
     error_message TEXT NULL,
@@ -35,11 +35,11 @@ CREATE TABLE IF NOT EXISTS checksum_jobs (
     INDEX idx_job_start_time (start_time)
 );`
 
-	createPartitionResultsTableSQL = `
-CREATE TABLE IF NOT EXISTS partition_results (
+	createBatchResultsTableSQL = `
+CREATE TABLE IF NOT EXISTS batch_checksum_results (
     result_id BIGINT AUTO_INCREMENT PRIMARY KEY,
     job_id BIGINT NOT NULL,
-    partition_index INT NOT NULL,
+    batch_index INT NOT NULL,
     source_checksum VARCHAR(64),
     target_checksum VARCHAR(64),
     source_row_count BIGINT,
@@ -66,9 +66,9 @@ func (s *Store) InitializeSchema() error {
 		return fmt.Errorf("failed to create checksum_jobs table: %w", err)
 	}
 
-	_, err = s.db.Exec(createPartitionResultsTableSQL)
+	_, err = s.db.Exec(createBatchResultsTableSQL)
 	if err != nil {
-		return fmt.Errorf("failed to create partition_results table: %w", err)
+		return fmt.Errorf("failed to create batch_checksum_results table: %w", err)
 	}
 
 	return nil
@@ -115,7 +115,7 @@ func (s *Store) UpdateJobCompletion(jobID int64, status string, overallMatch boo
 	}
 	query := `UPDATE checksum_jobs
 	          SET status = ?, overall_match = ?, source_total_rows = ?, target_total_rows = ?,
-	              mismatched_partitions_count = ?, end_time = ?, error_message = ?
+	              mismatched_batch_count = ?, end_time = ?, error_message = ?
 	          WHERE job_id = ?`
 	endTime := time.Now()
 	_, err := s.db.Exec(query, status, overallMatch, srcTotalRows, targetTotalRows, mismatchedCount, endTime, sql.NullString{String: errorMessage, Valid: errorMessage != ""}, jobID)
@@ -125,10 +125,10 @@ func (s *Store) UpdateJobCompletion(jobID int64, status string, overallMatch boo
 	return nil
 }
 
-// PartitionResultData holds data for a single partition result to be saved.
-type PartitionResultData struct {
+// BatchResultData holds data for a single batch result to be saved.
+type BatchResultData struct {
 	JobID          int64
-	PartitionIndex int
+	BatchIndex     int
 	SourceChecksum string
 	TargetChecksum string
 	SourceRowCount int64
@@ -139,17 +139,17 @@ type PartitionResultData struct {
 	TargetError    string
 }
 
-// SavePartitionResult inserts a result record for a specific partition.
-func (s *Store) SavePartitionResult(data PartitionResultData) error {
+// SaveBatchResult inserts a result record for a specific batch.
+func (s *Store) SaveBatchResult(data BatchResultData) error {
 	if s.db == nil {
 		return fmt.Errorf("database connection is nil")
 	}
-	query := `INSERT INTO partition_results (job_id, partition_index, source_checksum, target_checksum,
+	query := `INSERT INTO batch_checksum_results (job_id, batch_index, source_checksum, target_checksum,
 	                                        source_row_count, target_row_count, checksum_match, row_count_match,
 	                                        source_error, target_error, comparison_time)
 	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	comparisonTime := time.Now()
-	_, err := s.db.Exec(query, data.JobID, data.PartitionIndex,
+	_, err := s.db.Exec(query, data.JobID, data.BatchIndex,
 		sql.NullString{String: data.SourceChecksum, Valid: data.SourceChecksum != ""},
 		sql.NullString{String: data.TargetChecksum, Valid: data.TargetChecksum != ""},
 		sql.NullInt64{Int64: data.SourceRowCount, Valid: true},
@@ -160,7 +160,7 @@ func (s *Store) SavePartitionResult(data PartitionResultData) error {
 		comparisonTime,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to save partition result for job %d, partition %d: %w", data.JobID, data.PartitionIndex, err)
+		return fmt.Errorf("failed to save batch result for job %d, batch %d: %w", data.JobID, data.BatchIndex, err)
 	}
 	return nil
 }

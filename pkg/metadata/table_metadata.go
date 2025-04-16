@@ -47,18 +47,18 @@ func (p *PKRange) String() string {
 	return fmt.Sprintf("(%v, %v)", p.StartPK, p.EndPK)
 }
 
-// Partition represents a range of rows in a table, typically defined by PK range.
-type Partition struct {
+// Batch represents a range of rows in a table, typically defined by PK range.
+type Batch struct {
 	TableInfo *TableInfo
 	Index     int
 	PKRange   *PKRange
-	RowCount  int64 // Estimated or actual row count in the partition
+	RowCount  int64 // Estimated or actual row count in the batch
 }
 
-func (p *Partition) GetStart() int64 {
+func (p *Batch) GetStart() int64 {
 	return p.PKRange.GetStart()
 }
 
-func (p *Partition) GetEnd() int64 {
+func (p *Batch) GetEnd() int64 {
 	return p.PKRange.GetEnd()
 }
