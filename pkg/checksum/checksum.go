@@ -14,19 +14,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// ChecksumResult holds the result of a checksum calculation.
-type ChecksumResult struct {
-	Count    int64
-	Checksum string
-}
-
-// RowData holds data for a single row.
-type RowData struct {
-	PK    interface{} // Primary Key value
-	Hash  string      // Hash of the row data
-	Error error
-}
-
 // CompareChecksumResults compares checksum results from two sources (e.g., master and replica).
 type CompareChecksumResults struct {
 	Match            bool
