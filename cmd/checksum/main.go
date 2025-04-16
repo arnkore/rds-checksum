@@ -41,27 +41,19 @@ type Options struct {
 
 func main() {
 	// --- Processing flags ---
-	var opts Options
-	parser := flags.NewParser(&opts, flags.Default)
-	_, err := parser.Parse()
-	if err != nil {
-		// Use fmt for initial flag parsing errors before logger is set up
-		fmt.Fprintf(os.Stderr, "error parsing flags: %v\n", err)
-		os.Exit(1)
-	}
+	opts := processFlags()
 
 	// --- Setup Logger ---
 	logger := setupLogger(opts.LogFile)
 
 	// --- Connect to Results DB ---
-	var resultConfig = &metadata.Config{
+	resultDbConnProvider := metadata.NewDBConnProvider(&metadata.Config{
 		Host:     opts.ResultHost,
 		Port:     opts.ResultPort,
 		User:     opts.ResultUser,
 		Password: opts.ResultPassword,
 		Database: opts.ResultDB,
-	}
-	resultDbConnProvider := metadata.NewDBConnProvider(resultConfig)
+	})
 	resultsDB, err := resultDbConnProvider.CreateDbConn()
 	if err != nil {
 		slog.Error("Error connecting to metadata database", "error", err)
@@ -69,14 +61,14 @@ func main() {
 	}
 	dbStore := storage.NewStore(resultsDB)
 
-	// --- Create and run the validator ---
+	// --- Create and run the checksum ---
 	slog.Info("Starting checksum validation", "source_ip", opts.SourceHost, "source_port", opts.SourcePort, "source_db", opts.SourceDB,
 		"target_ip", opts.TargetHost, "target_port", opts.TargetPort, "target_db", opts.TargetDB,
 		"table", opts.TableName, "batch_size", opts.RowsPerBatch, "concurrency", opts.ConcurrentLimit)
 	srcConfig := metadata.NewConfig(opts.SourceHost, opts.SourcePort, opts.SourceUser, opts.SourcePassword, opts.SourceDB)
 	targetConfig := metadata.NewConfig(opts.TargetHost, opts.TargetPort, opts.TargetUser, opts.TargetPassword, opts.TargetDB)
 	validator := checksum.NewChecksumValidator(logger, srcConfig, targetConfig, opts.TableName, opts.RowsPerBatch, opts.ConcurrentLimit, dbStore)
-	result, runErr := validator.RunValidation()
+	result, runErr := validator.Run()
 
 	// --- Handle Results ---
 	jobID := validator.GetJobID() // Assume validator exposes the job ID it created
@@ -87,7 +79,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// If we reached here, RunValidation completed its process (though checksums might mismatch)
+	// If we reached here, Run completed its process (though checksums might mismatch)
 	// Results are stored in DB, provide summary log
 	if result.Match {
 		slog.Info("✅ Result: Checksums match.", "job_id", jobID)
@@ -95,6 +87,18 @@ func main() {
 		slog.Warn("❌ Result: Checksums DO NOT match.", "job_id", jobID)
 	}
 	os.Exit(0)
+}
+
+func processFlags() Options {
+	var opts Options
+	parser := flags.NewParser(&opts, flags.Default)
+	_, err := parser.Parse()
+	if err != nil {
+		// Use fmt for initial flag parsing errors before logger is set up
+		fmt.Fprintf(os.Stderr, "error parsing flags: %v\n", err)
+		os.Exit(1)
+	}
+	return opts
 }
 
 func setupLogger(logFile string) *slog.Logger {

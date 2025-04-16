@@ -12,15 +12,11 @@ type BatchCalculator struct {
 }
 
 // NewBatchCalculator creates a new BatchCalculator.
-func NewBatchCalculator(tableInfo *metadata.TableInfo, rowsPerBatch int) (*BatchCalculator, error) {
-	if tableInfo.PrimaryKey == "" {
-		return nil, fmt.Errorf("cannot batch table %s without a primary key", tableInfo.TableName)
-	}
-	// Further checks could be added here, e.g., ensuring PK is numeric for range partitioning.
+func NewBatchCalculator(tableInfo *metadata.TableInfo, rowsPerBatch int) *BatchCalculator {
 	return &BatchCalculator{
 		TableInfo:    tableInfo,
 		RowsPerBatch: rowsPerBatch,
-	}, nil
+	}
 }
 
 // CalculateBatches divides the table into batches based on the primary key.
