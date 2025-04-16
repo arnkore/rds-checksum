@@ -14,6 +14,18 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// JobStatus defines the possible statuses for a checksum job.
+type JobStatus string
+
+const (
+	JobStatusPending           JobStatus = "pending"
+	JobStatusRunning           JobStatus = "running"
+	JobStatusCompleted         JobStatus = "completed"
+	JobStatusCompletedMismatch JobStatus = "completed_mismatch"
+	JobStatusFailed            JobStatus = "failed"
+	// Add other potential statuses here if needed
+)
+
 // CompareChecksumResults compares checksum results from two sources (e.g., master and replica).
 type CompareChecksumResults struct {
 	Match            bool
@@ -73,20 +85,33 @@ type BatchComparisonSummary struct {
 
 // updateJobStatus updates the job status in the database.
 func (v *ChecksumValidator) updateJobStatus(comparisonResult *CompareChecksumResults, finalError error) {
-	status := "completed"
+	var status JobStatus // Use the enum type
 	errMsg := ""
 	mismatchedCount := 0
 
-	// Ensure comparisonResult is not nil before accessing
-	if comparisonResult != nil {
-		if !comparisonResult.Match {
-			status = "completed_mismatch"
+	// Determine status based on comparisonResult and finalError
+	if finalError != nil {
+		status = JobStatusFailed
+		errMsg = finalError.Error() // Capture the final error message
+	} else if comparisonResult != nil {
+		if comparisonResult.Match {
+			status = JobStatusCompleted
+		} else {
+			status = JobStatusCompletedMismatch
 		}
 		mismatchedCount = len(comparisonResult.MismatchBatches)
+		// Capture specific errors if finalError was nil but comparison had issues
+		if comparisonResult.SrcError != nil {
+			errMsg = fmt.Sprintf("Source error: %s;", comparisonResult.SrcError.Error())
+		}
+		if comparisonResult.TargetError != nil {
+			errMsg += fmt.Sprintf("Target error: %s", comparisonResult.TargetError.Error())
+		}
 	} else {
-		// If comparisonResult is nil, it implies an early failure
-		status = "failed"
-		finalError = fmt.Errorf("unknown early failure, comparison result is nil")
+		// This case should ideally be covered by finalError, but as a fallback:
+		status = JobStatusFailed
+		errMsg = "Unknown early failure, comparison result is nil"
+		finalError = fmt.Errorf(errMsg) // Ensure finalError reflects this state
 	}
 
 	// Safely access comparisonResult fields, providing defaults if nil
@@ -100,8 +125,9 @@ func (v *ChecksumValidator) updateJobStatus(comparisonResult *CompareChecksumRes
 
 	// Use slog for structured logging
 	v.logger.Info("Attempting to update job completion status", "job_id", v.jobID, "status", status, "match", matchStatus,
-		"source_rows", srcRows, "target_rows", tgtRows, "mismatched_batches", mismatchedCount, "error", errMsg)
-	err := v.dbStore.UpdateJobCompletion(v.jobID, status, matchStatus, srcRows, tgtRows, mismatchedCount, errMsg)
+		"source_rows", srcRows, "target_rows", tgtRows, "mismatched_batches", mismatchedCount, "error_message", errMsg)
+	// Convert enum back to string for the database layer
+	err := v.dbStore.UpdateJobCompletion(v.jobID, string(status), matchStatus, srcRows, tgtRows, mismatchedCount, errMsg)
 	if err != nil {
 		v.logger.Error("Failed to update final job status", "job_id", v.jobID, "error", err)
 	}

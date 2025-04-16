@@ -55,25 +55,6 @@ CREATE TABLE IF NOT EXISTS batch_checksum_results (
 );`
 )
 
-// InitializeSchema creates the necessary database tables if they don't exist.
-func (s *Store) InitializeSchema() error {
-	if s.db == nil {
-		return fmt.Errorf("database connection is nil")
-	}
-
-	_, err := s.db.Exec(createChecksumJobsTableSQL)
-	if err != nil {
-		return fmt.Errorf("failed to create checksum_jobs table: %w", err)
-	}
-
-	_, err = s.db.Exec(createBatchResultsTableSQL)
-	if err != nil {
-		return fmt.Errorf("failed to create batch_checksum_results table: %w", err)
-	}
-
-	return nil
-}
-
 // CreateJob inserts a new job record and returns its ID.
 func (s *Store) CreateJob(tableName string, rowsPerBatch int) (int64, error) {
 	query := `INSERT INTO checksum_jobs (table_name, rows_per_batch, status, start_time) VALUES (?, ?, ?, ?)`
@@ -86,26 +67,6 @@ func (s *Store) CreateJob(tableName string, rowsPerBatch int) (int64, error) {
 		return 0, fmt.Errorf("failed to get last insert ID for job: %w", err)
 	}
 	return jobID, nil
-}
-
-// UpdateJobStatus updates the status and optionally an error message for a job.
-func (s *Store) UpdateJobStatus(jobID int64, status string, errorMessage string) error {
-	var query string
-	var args []any
-
-	if errorMessage != "" {
-		query = `UPDATE checksum_jobs SET status = ?, error_message = ? WHERE job_id = ?`
-		args = append(args, status, errorMessage, jobID)
-	} else {
-		query = `UPDATE checksum_jobs SET status = ? WHERE job_id = ?`
-		args = append(args, status, jobID)
-	}
-
-	_, err := s.db.Exec(query, args...)
-	if err != nil {
-		return fmt.Errorf("failed to update job status for job %d: %w", jobID, err)
-	}
-	return nil
 }
 
 // UpdateJobCompletion updates the job record upon successful or failed completion.
@@ -164,5 +125,3 @@ func (s *Store) SaveBatchResult(data BatchResultData) error {
 	}
 	return nil
 }
-
-// Add helper functions to convert potential errors to strings, handle NULLs etc. as needed.
