@@ -2,7 +2,7 @@ package checksum
 
 import (
 	"fmt"
-	"log/slog" // Added slog
+	"github.com/rs/zerolog/log"
 	"sort"
 	"sync"
 
@@ -40,7 +40,6 @@ type CompareChecksumResults struct {
 
 // ChecksumValidator orchestrates the checksum validation process.
 type ChecksumValidator struct {
-	logger       *slog.Logger     // Added logger
 	SrcConfig    *metadata.Config // Source Config (e.g., Master)
 	TargetConfig *metadata.Config // Target Config (e.g., Replica)
 	TableName    string
@@ -51,13 +50,8 @@ type ChecksumValidator struct {
 }
 
 // NewChecksumValidator creates a new validator.
-func NewChecksumValidator(logger *slog.Logger, src, target *metadata.Config, tableName string, rowsPerBatch int, concurrency int, store *storage.Store) *ChecksumValidator {
-	if logger == nil {
-		// Fallback to a default logger if none is provided (optional, depends on desired behavior)
-		logger = slog.Default()
-	}
+func NewChecksumValidator(src, target *metadata.Config, tableName string, rowsPerBatch int, concurrency int, store *storage.Store) *ChecksumValidator {
 	return &ChecksumValidator{
-		logger:       logger, // Stored logger
 		SrcConfig:    src,
 		TargetConfig: target,
 		TableName:    tableName,
@@ -124,12 +118,18 @@ func (v *ChecksumValidator) updateJobStatus(comparisonResult *CompareChecksumRes
 	}
 
 	// Use slog for structured logging
-	v.logger.Info("Attempting to update job completion status", "job_id", v.jobID, "status", status, "match", matchStatus,
-		"source_rows", srcRows, "target_rows", tgtRows, "mismatched_batches", mismatchedCount, "error_message", errMsg)
+	log.Info().Int64("job_id", v.jobID).
+		Str("status", string(status)).
+		Bool("match", matchStatus).
+		Int64("source_rows", srcRows).
+		Int64("target_rows", tgtRows).
+		Int("mismatched_batches", mismatchedCount).
+		Str("error_message", errMsg).
+		Msg("Attempting to update job completion status")
 	// Convert enum back to string for the database layer
 	err := v.dbStore.UpdateJobCompletion(v.jobID, string(status), matchStatus, srcRows, tgtRows, mismatchedCount, errMsg)
 	if err != nil {
-		v.logger.Error("Failed to update final job status", "job_id", v.jobID, "error", err)
+		log.Error().Int64("job_id", v.jobID).Err(err).Msg("Failed to update final job status")
 	}
 }
 
@@ -186,7 +186,7 @@ func (v *ChecksumValidator) calculateBatches(srcInfo *metadata.TableInfo) ([]met
 	if err != nil {
 		return nil, fmt.Errorf("failed to calculate batches: %w", err)
 	}
-	v.logger.Info("Calculated batches", "count", len(batches), "table", v.TableName)
+	log.Info().Int("count", len(batches)).Str("table", v.TableName).Msg("Calculated batches")
 	return batches, nil
 }
 
@@ -200,13 +200,16 @@ func (v *ChecksumValidator) processBatchesConcurrently(srcInfo *metadata.TableIn
 	srcProvider := metadata.NewDBConnProvider(v.SrcConfig)       // Assuming DBConnProvider doesn't need logger yet
 	targetProvider := metadata.NewDBConnProvider(v.TargetConfig) // Assuming DBConnProvider doesn't need logger yet
 
-	v.logger.Info("Starting concurrent batch processing", "batch_count", len(batches), "concurrency", v.concurrency)
+	log.Info().Int("batch_count", len(batches)).
+		Int("concurrency", v.concurrency).
+		Msg("Starting concurrent batch processing")
 
 	for _, p := range batches {
 		part := p                                                                   // Capture loop variable
 		pcc := batch.NewBatchChecksumCalculator(&part, srcProvider, targetProvider) // Assuming BatchChecksumCalculator doesn't need logger yet
 		eg.Go(func() error {
-			v.logger.Debug("Starting batch processing", "batch_index", part.Index)
+			log.Debug().Int("batch_index", part.Index).
+				Msg("Starting batch processing")
 			var checksumInfo = pcc.CalculateAndCompareChecksum(columns) // Assuming CalculateAndCompareChecksum doesn't need logger yet
 			v.saveBatchResultToDB(part.Index, checksumInfo)
 
@@ -218,7 +221,8 @@ func (v *ChecksumValidator) processBatchesConcurrently(srcInfo *metadata.TableIn
 				SourceErr:     checksumInfo.SrcErr,
 				TargetErr:     checksumInfo.TargetErr,
 			}
-			v.logger.Info("Finished batch processing", "batch_index", part.Index)
+			log.Info().Int("batch_index", part.Index).
+				Msg("Finished batch processing")
 			// Propagate errors from CalculateAndCompareChecksum if necessary (currently handled in BatchComparisonSummary)
 			// return checksumInfo.SrcErr // Or combine errors
 			return nil // errgroup handles errors returned here
@@ -231,10 +235,11 @@ func (v *ChecksumValidator) processBatchesConcurrently(srcInfo *metadata.TableIn
 	for summary := range resultsChan {
 		summaries = append(summaries, summary)
 	}
-	v.logger.Info("Finished processing all batches", "processed_count", len(summaries))
+	log.Info().Int("processed_count", len(summaries)).
+		Msg("Finished processing all batches")
 
 	if groupErr != nil {
-		v.logger.Error("Error occurred during concurrent batch processing", "error", groupErr)
+		log.Error().Err(groupErr).Msg("Error occurred during concurrent batch processing")
 	}
 
 	// Return summaries and the critical error from the group
@@ -245,18 +250,28 @@ func (v *ChecksumValidator) processBatchesConcurrently(srcInfo *metadata.TableIn
 func (v *ChecksumValidator) saveBatchResultToDB(batchIndex int, checksumInfo *batch.BatchChecksumInfo) {
 	// Log errors regardless of DB storage
 	if checksumInfo.SrcErr != nil {
-		v.logger.Error("Batch source error", "batch_index", batchIndex, "error", checksumInfo.SrcErr)
+		log.Error().Int("batch_index", batchIndex).
+			Err(checksumInfo.SrcErr).
+			Msg("Batch source error")
 	}
 	if checksumInfo.TargetErr != nil {
-		v.logger.Error("Batch target error", "batch_index", batchIndex, "error", checksumInfo.TargetErr)
+		log.Error().Int("batch_index", batchIndex).
+			Err(checksumInfo.TargetErr).
+			Msg("Batch target error")
 	}
 
 	// Log mismatches immediately
 	if !checksumInfo.IsRowCountMatch() {
-		v.logger.Warn("Batch row count mismatch", "batch_index", batchIndex, "source_rows", checksumInfo.SrcRowCount, "target_rows", checksumInfo.TargetRowCount)
+		log.Warn().Int("batch_index", batchIndex).
+			Int64("source_rows", checksumInfo.SrcRowCount).
+			Int64("target_rows", checksumInfo.TargetRowCount).
+			Msg("Batch row count mismatch")
 	} else if !checksumInfo.IsChecksumMatch() {
 		// Only log checksum mismatch if row counts matched (otherwise it's implied)
-		v.logger.Warn("Batch checksum mismatch", "batch_index", batchIndex, "source_checksum", checksumInfo.SrcChecksum, "target_checksum", checksumInfo.TargetChecksum)
+		log.Warn().Int("batch_index", batchIndex).
+			Str("source_checksum", checksumInfo.SrcChecksum).
+			Str("target_checksum", checksumInfo.TargetChecksum).
+			Msg("Batch checksum mismatch")
 	}
 
 	// Save to DB if configured and job created
@@ -278,12 +293,20 @@ func (v *ChecksumValidator) saveBatchResultToDB(batchIndex int, checksumInfo *ba
 		dbErr := v.dbStore.SaveBatchResult(batchResultData)
 
 		if dbErr != nil {
-			v.logger.Error("Failed to save batch result to database", "job_id", v.jobID, "batch_index", batchIndex, "error", dbErr)
+			log.Error().Int64("job_id", v.jobID).
+				Int("batch_index", batchIndex).
+				Err(dbErr).
+				Msg("Failed to save batch result to database")
 		} else {
-			v.logger.Debug("Saved batch result to database", "job_id", v.jobID, "batch_index", batchIndex)
+			log.Debug().Int64("job_id", v.jobID).
+				Int("batch_index", batchIndex).
+				Msg("Saved batch result to database")
 		}
 	} else {
-		v.logger.Debug("Skipping DB save for batch result", "job_id", v.jobID, "batch_index", batchIndex, "db_store_nil", v.dbStore == nil)
+		log.Debug().Int64("job_id", v.jobID).
+			Int("batch_index", batchIndex).
+			Bool("db_store_nil", v.dbStore == nil).
+			Msg("Skipping DB save for batch result")
 	}
 }
 
@@ -331,18 +354,23 @@ func (v *ChecksumValidator) Run() (finalResult *CompareChecksumResults, finalErr
 		v.updateJobStatus(finalResult, finalError)
 		// Maybe add a final log summarizing the run outcome based on finalError and finalResult.Match
 		if finalError != nil {
-			v.logger.Error("Validation run finished with error", "job_id", v.jobID, "error", finalError)
+			log.Error().Int64("job_id", v.jobID).Err(finalError).
+				Msg("Validation run finished with error")
 		} else if finalResult != nil && !finalResult.Match {
-			v.logger.Warn("Validation run finished with mismatches", "job_id", v.jobID, "mismatched_batches", len(finalResult.MismatchBatches))
+			log.Warn().Int64("job_id", v.jobID).
+				Int("mismatched_batches", len(finalResult.MismatchBatches)).
+				Msg("Validation run finished with mismatches")
 		} else {
-			v.logger.Info("Validation run finished successfully", "match", finalResult.Match, "job_id", v.jobID)
+			log.Info().Bool("match", finalResult.Match).
+				Int64("job_id", v.jobID).
+				Msg("Validation run finished successfully")
 		}
 	}()
 
 	// Create job record first
 	err := v.createJobRecord()
 	if err != nil {
-		v.logger.Error("Failed to create checksum job in database. Proceeding without DB logging.", "error", err)
+		log.Error().Err(err).Msg("Failed to create checksum job in database. Proceeding without DB logging.")
 	}
 
 	// --- Metadata Setup ---
@@ -350,7 +378,7 @@ func (v *ChecksumValidator) Run() (finalResult *CompareChecksumResults, finalErr
 	targetConnProvider := metadata.NewDBConnProvider(v.TargetConfig)
 	srcInfo, targetInfo, metaErr := v.setupMetadata(srcConnProvider, targetConnProvider)
 	if metaErr != nil {
-		v.logger.Error("Metadata setup failed", "error", metaErr)
+		log.Error().Err(metaErr).Msg("Metadata setup failed")
 		finalError = fmt.Errorf("metadata setup failed: %w", metaErr)
 		return finalResult, finalError // Return immediately on critical setup error
 	}
@@ -362,12 +390,13 @@ func (v *ChecksumValidator) Run() (finalResult *CompareChecksumResults, finalErr
 	// --- Batch Calculation ---
 	batches, batchErr := v.calculateBatches(srcInfo)
 	if batchErr != nil {
-		v.logger.Error("Failed to calculate batches", "error", batchErr)
+		log.Error().Err(batchErr).Msg("Failed to calculate batches")
 		finalError = fmt.Errorf("batch calculation failed: %w", batchErr) // Keep fmt for error wrapping
 		return finalResult, finalError                                    // Return immediately
 	}
 	if len(batches) == 0 {
-		v.logger.Warn("No batches calculated, possibly an empty table or configuration issue.", "table", v.TableName)
+		log.Warn().Str("table", v.TableName).
+			Msg("No batches calculated, possibly an empty table or configuration issue.")
 		// Consider this a success (empty tables match), or handle as needed.
 		finalResult.Match = true // Explicitly set match for empty table case
 		return finalResult, nil  // Nothing more to do
@@ -377,11 +406,11 @@ func (v *ChecksumValidator) Run() (finalResult *CompareChecksumResults, finalErr
 	batchSummaries, processErr := v.processBatchesConcurrently(srcInfo, batches)
 	if processErr != nil {
 		finalError = fmt.Errorf("concurrent batch processing failed: %w", processErr)
-		v.logger.Warn("Aggregating potentially incomplete batch results due to processing error")
+		log.Warn().Msg("Aggregating potentially incomplete batch results due to processing error")
 	}
 
 	// --- Aggregate Results ---
-	v.logger.Info("Aggregating batch results", "count", len(batchSummaries))
+	log.Info().Int("count", len(batchSummaries)).Msg("Aggregating batch results")
 	v.aggregateBatchResults(batchSummaries, finalResult)
 	return finalResult, finalError
 }

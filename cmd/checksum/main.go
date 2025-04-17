@@ -7,10 +7,11 @@ import (
 	"github.com/arnkore/rds-checksum/pkg/storage" // Assuming storage package exists
 	"github.com/jessevdk/go-flags"
 	"io"
-	"log/slog"
 	"os"
 
 	_ "github.com/go-sql-driver/mysql" // Assuming MySQL for results DB
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 type Options struct {
@@ -44,7 +45,7 @@ func main() {
 	opts := processFlags()
 
 	// --- Setup Logger ---
-	logger := setupLogger(opts.LogFile)
+	setupLogger(opts.LogFile)
 
 	// --- Connect to Results DB ---
 	resultDbConnProvider := metadata.NewDBConnProvider(&metadata.Config{
@@ -56,18 +57,25 @@ func main() {
 	})
 	resultsDB, err := resultDbConnProvider.CreateDbConn()
 	if err != nil {
-		slog.Error("Error connecting to metadata database", "error", err)
+		log.Error().Err(err).Msg("Error connecting to metadata database")
 		os.Exit(1)
 	}
 	dbStore := storage.NewStore(resultsDB)
 
 	// --- Create and run the checksum ---
-	slog.Info("Starting checksum validation", "source_ip", opts.SourceHost, "source_port", opts.SourcePort, "source_db", opts.SourceDB,
-		"target_ip", opts.TargetHost, "target_port", opts.TargetPort, "target_db", opts.TargetDB,
-		"table", opts.TableName, "batch_size", opts.RowsPerBatch, "concurrency", opts.ConcurrentLimit)
+	log.Info().Str("source_ip", opts.SourceHost).
+		Int("source_port", opts.SourcePort).
+		Str("source_db", opts.SourceDB).
+		Str("target_ip", opts.TargetHost).
+		Int("target_port", opts.TargetPort).
+		Str("target_db", opts.TargetDB).
+		Str("table", opts.TableName).
+		Int("batch_size", opts.RowsPerBatch).
+		Int("concurrency", opts.ConcurrentLimit).
+		Msg("Starting checksum validation")
 	srcConfig := metadata.NewConfig(opts.SourceHost, opts.SourcePort, opts.SourceUser, opts.SourcePassword, opts.SourceDB)
 	targetConfig := metadata.NewConfig(opts.TargetHost, opts.TargetPort, opts.TargetUser, opts.TargetPassword, opts.TargetDB)
-	validator := checksum.NewChecksumValidator(logger, srcConfig, targetConfig, opts.TableName, opts.RowsPerBatch, opts.ConcurrentLimit, dbStore)
+	validator := checksum.NewChecksumValidator(srcConfig, targetConfig, opts.TableName, opts.RowsPerBatch, opts.ConcurrentLimit, dbStore)
 	result, runErr := validator.Run()
 
 	// --- Handle Results ---
@@ -75,16 +83,16 @@ func main() {
 
 	if runErr != nil {
 		// Error occurred *during* validation run (potentially after job created)
-		slog.Error("Validation job run failed and potentially incomplete", "job_id", jobID, "error", runErr)
+		log.Error().Err(runErr).Int64("job_id", jobID).Msg("Validation job run failed and potentially incomplete")
 		os.Exit(1)
 	}
 
 	// If we reached here, Run completed its process (though checksums might mismatch)
 	// Results are stored in DB, provide summary log
 	if result.Match {
-		slog.Info("✅ Result: Checksums match.", "job_id", jobID)
+		log.Info().Int64("job_id", jobID).Msg("✅ Result: Checksums match.")
 	} else {
-		slog.Warn("❌ Result: Checksums DO NOT match.", "job_id", jobID)
+		log.Warn().Int64("job_id", jobID).Msg("❌ Result: Checksums DO NOT match.")
 	}
 	os.Exit(0)
 }
@@ -101,23 +109,19 @@ func processFlags() Options {
 	return opts
 }
 
-func setupLogger(logFile string) *slog.Logger {
-	var logWriter io.Writer = os.Stderr // Default to stderr for errors/info before file check
+func setupLogger(logFile string) {
+	var logWriter io.Writer = zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: zerolog.TimeFieldFormat} // Default to pretty stderr
 	if logFile != "" {
-		logFile, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
+		logF, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
 		if err != nil {
-			// Still use fmt here as logger setup failed
-			fmt.Fprintf(os.Stderr, "error opening log file %s: %v\n", logFile, err)
-			os.Exit(1)
+			log.Fatal().Err(err).Str("file", logFile).Msg("Error opening log file")
 		}
-		defer logFile.Close()
-		// Use MultiWriter to write to both file and stderr
-		logWriter = io.MultiWriter(os.Stderr, logFile)
+		// Don't close logF here, let the process handle it
+		// Use MultiWriter to write to both file (plain JSON) and console (pretty)
+		logWriter = zerolog.MultiLevelWriter(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: zerolog.TimeFieldFormat}, logF)
 	}
 
-	// Configure slog logger
-	logLevel := new(slog.LevelVar) // Defaults to Info
-	logger := slog.New(slog.NewTextHandler(logWriter, &slog.HandlerOptions{Level: logLevel}))
-	slog.SetDefault(logger)
-	return logger
+	// Configure zerolog logger
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMs              // Example: Use Unix time with milliseconds
+	log.Logger = zerolog.New(logWriter).With().Timestamp().Logger() // Set as global logger
 }
