@@ -8,6 +8,7 @@ import (
 	"github.com/jessevdk/go-flags"
 	"io"
 	"os"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql" // Assuming MySQL for results DB
 	"github.com/rs/zerolog"
@@ -110,7 +111,7 @@ func processFlags() Options {
 }
 
 func setupLogger(logFile string) {
-	var logWriter io.Writer = zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: zerolog.TimeFieldFormat} // Default to pretty stderr
+	var logWriter io.Writer = zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339Nano} // Default to pretty stderr
 	if logFile != "" {
 		logF, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
 		if err != nil {
@@ -118,10 +119,10 @@ func setupLogger(logFile string) {
 		}
 		// Don't close logF here, let the process handle it
 		// Use MultiWriter to write to both file (plain JSON) and console (pretty)
-		logWriter = zerolog.MultiLevelWriter(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: zerolog.TimeFieldFormat}, logF)
+		logWriter = zerolog.MultiLevelWriter(logWriter, logF)
 	}
 
 	// Configure zerolog logger
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMs              // Example: Use Unix time with milliseconds
+	zerolog.TimeFieldFormat = "2006-01-02 15:04:05.000"
 	log.Logger = zerolog.New(logWriter).With().Timestamp().Logger() // Set as global logger
 }
