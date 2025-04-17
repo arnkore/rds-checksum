@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"github.com/arnkore/rds-checksum/pkg/checksum"
 	"github.com/arnkore/rds-checksum/pkg/metadata"
@@ -43,6 +44,10 @@ type Options struct {
 }
 
 func main() {
+	// 使用 context 控制取消
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// --- Processing flags ---
 	opts := processFlags()
 
@@ -78,6 +83,7 @@ func main() {
 	srcConfig := metadata.NewConfig(opts.SourceHost, opts.SourcePort, opts.SourceUser, opts.SourcePassword, opts.SourceDB)
 	targetConfig := metadata.NewConfig(opts.TargetHost, opts.TargetPort, opts.TargetUser, opts.TargetPassword, opts.TargetDB)
 	validator := checksum.NewChecksumValidator(srcConfig, targetConfig, opts.TableName, opts.RowsPerBatch, opts.ConcurrentLimit, opts.CalcCrc32InDB, dbStore)
+	go setRetryTask(ctx, validator)
 	result, runErr := validator.Run()
 
 	// --- Handle Results ---
@@ -97,6 +103,23 @@ func main() {
 		log.Warn().Int64("job_id", jobID).Msg("❌ Result: Checksums DO NOT match.")
 	}
 	os.Exit(0)
+}
+
+func setRetryTask(ctx context.Context, validator *checksum.ChecksumValidator) {
+	// 每秒触发一次
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop() // 确保停止 ticker，防止资源泄漏
+
+	for {
+		select {
+		case <-ticker.C:
+			fmt.Println("执行重试任务:", time.Now())
+			validator.RetryChecksum()
+		case <-ctx.Done():
+			fmt.Println("任务停止")
+			return
+		}
+	}
 }
 
 func processFlags() *Options {

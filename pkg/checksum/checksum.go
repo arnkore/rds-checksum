@@ -3,16 +3,15 @@ package checksum
 import (
 	"fmt"
 	"github.com/arnkore/rds-checksum/pkg/common"
-	"github.com/rs/zerolog/log"
-	"sort"
-	"sync"
-
-	"github.com/arnkore/rds-checksum/pkg/batch"
 	"github.com/arnkore/rds-checksum/pkg/metadata"
 	"github.com/arnkore/rds-checksum/pkg/storage" // Added storage import
-
+	"github.com/enriquebris/goconcurrentqueue"
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/errgroup"
+	"sort"
+	"sync"
+	"sync/atomic"
 )
 
 // CompareChecksumResults compares checksum results from two sources (e.g., master and replica).
@@ -29,33 +28,43 @@ type CompareChecksumResults struct {
 
 // ChecksumValidator orchestrates the checksum validation process.
 type ChecksumValidator struct {
-	SrcConfig     *metadata.Config // Source Config (e.g., Master)
-	TargetConfig  *metadata.Config // Target Config (e.g., Replica)
-	TableName     string
-	RowsPerBatch  int // Target number of rows per batch/batch
-	CalcCRC32InDB bool
-	dbStore       *storage.Store // Added: Database store for results
-	jobID         int64          // Added: ID of the current job in the DB
-	concurrency   int
+	TableName               string
+	RowsPerBatch            int // Target number of rows per batch/batch
+	CalcCRC32InDB           bool
+	DbStore                 *storage.Store // Added: Database store for results
+	RetryQueue              *goconcurrentqueue.FIFO
+	JobID                   int64 // Added: ID of the current job in the DB
+	Concurrency             int
+	SrcConnProvider         *metadata.DbConnProvider
+	TargetConnProvider      *metadata.DbConnProvider
+	SrcTableMetaProvider    *metadata.TableMetaProvider
+	TargetTableMetaProvider *metadata.TableMetaProvider
 }
 
 // NewChecksumValidator creates a new validator.
-func NewChecksumValidator(src, target *metadata.Config, tableName string, rowsPerBatch int, concurrency int, calcCrc32InDb bool, store *storage.Store) *ChecksumValidator {
+func NewChecksumValidator(srcConfig, targetConfig *metadata.Config, tableName string, rowsPerBatch int, concurrency int, calcCrc32InDb bool, store *storage.Store) *ChecksumValidator {
+	srcConnProvider := metadata.NewDBConnProvider(srcConfig)
+	targetConnProvider := metadata.NewDBConnProvider(targetConfig)
+	srcMetaProvider := metadata.NewTableMetaProvider(srcConnProvider, srcConfig.Database, tableName)
+	targetMetaProvider := metadata.NewTableMetaProvider(targetConnProvider, targetConfig.Database, tableName)
 	return &ChecksumValidator{
-		SrcConfig:     src,
-		TargetConfig:  target,
-		TableName:     tableName,
-		RowsPerBatch:  rowsPerBatch,
-		CalcCRC32InDB: calcCrc32InDb,
-		dbStore:       store, // Added
-		jobID:         0,     // Initialized
-		concurrency:   concurrency,
+		TableName:               tableName,
+		RowsPerBatch:            rowsPerBatch,
+		CalcCRC32InDB:           calcCrc32InDb,
+		DbStore:                 store, // Added
+		RetryQueue:              goconcurrentqueue.NewFIFO(),
+		JobID:                   0, // Initialized
+		Concurrency:             concurrency,
+		SrcConnProvider:         srcConnProvider,
+		TargetConnProvider:      targetConnProvider,
+		SrcTableMetaProvider:    srcMetaProvider,
+		TargetTableMetaProvider: targetMetaProvider,
 	}
 }
 
 // GetJobID returns the database job ID associated with this validation run.
 func (cv *ChecksumValidator) GetJobID() int64 {
-	return cv.jobID
+	return cv.JobID
 }
 
 // Represents the outcome of comparing a single batch
@@ -64,6 +73,7 @@ type BatchComparisonSummary struct {
 	Match         bool // True if checksums and row counts match and no errors
 	ChecksumMatch bool
 	RowCountMatch bool
+	RetryRowMap   map[int64]*RetryCheckRow
 	SourceErr     error
 	TargetErr     error
 }
@@ -109,7 +119,7 @@ func (cv *ChecksumValidator) updateJobStatus(comparisonResult *CompareChecksumRe
 	}
 
 	// Use slog for structured logging
-	log.Info().Int64("job_id", cv.jobID).
+	log.Info().Int64("job_id", cv.JobID).
 		Str("status", string(status)).
 		Bool("match", matchStatus).
 		Int64("source_rows", srcRows).
@@ -118,21 +128,21 @@ func (cv *ChecksumValidator) updateJobStatus(comparisonResult *CompareChecksumRe
 		Str("error_message", errMsg).
 		Msg("Attempting to update job completion status")
 	// Convert enum back to string for the database layer
-	err := cv.dbStore.UpdateJobCompletion(cv.jobID, string(status), matchStatus, srcRows, tgtRows, mismatchedCount, errMsg)
+	err := cv.DbStore.UpdateJobCompletion(cv.JobID, string(status), matchStatus, srcRows, tgtRows, mismatchedCount, errMsg)
 	if err != nil {
-		log.Error().Int64("job_id", cv.jobID).Err(err).Msg("Failed to update final job status")
+		log.Error().Int64("job_id", cv.JobID).Err(err).Msg("Failed to update final job status")
 	}
 }
 
 // createJobRecord creates a job record in the database.
 func (cv *ChecksumValidator) createJobRecord() error {
 	var err error
-	cv.jobID, err = cv.dbStore.CreateJob(cv.TableName, cv.RowsPerBatch)
+	cv.JobID, err = cv.DbStore.CreateJob(cv.TableName, cv.RowsPerBatch)
 	return err
 }
 
 // setupMetadata establishes DB connections, fetches metadata, and performs initial checks.
-func (cv *ChecksumValidator) setupMetadata(srcConnProvider, targetConnProvider *metadata.DbConnProvider) (*metadata.TableInfo, *metadata.TableInfo, error) {
+func (cv *ChecksumValidator) setupMetadata() (*metadata.TableInfo, *metadata.TableInfo, error) {
 	var srcInfo, targetInfo *metadata.TableInfo
 	var srcMetaErr, targetMetaErr error
 	// Get metadata concurrently
@@ -140,13 +150,11 @@ func (cv *ChecksumValidator) setupMetadata(srcConnProvider, targetConnProvider *
 	metaWg.Add(2)
 	go func() {
 		defer metaWg.Done()
-		srcMetaProvider := metadata.NewTableMetaProvider(srcConnProvider, cv.SrcConfig.Database, cv.TableName)
-		srcInfo, srcMetaErr = srcMetaProvider.QueryTableInfo(cv.TableName)
+		srcInfo, srcMetaErr = cv.SrcTableMetaProvider.QueryTableInfo(cv.TableName)
 	}()
 	go func() {
 		defer metaWg.Done()
-		targetMetaProvider := metadata.NewTableMetaProvider(targetConnProvider, cv.TargetConfig.Database, cv.TableName)
-		targetInfo, targetMetaErr = targetMetaProvider.QueryTableInfo(cv.TableName)
+		targetInfo, targetMetaErr = cv.TargetTableMetaProvider.QueryTableInfo(cv.TableName)
 	}()
 	metaWg.Wait()
 
@@ -172,7 +180,7 @@ func (cv *ChecksumValidator) setupMetadata(srcConnProvider, targetConnProvider *
 
 // calculateBatches determines the batches for checksum based on source table info.
 func (cv *ChecksumValidator) calculateBatches(srcInfo *metadata.TableInfo) ([]metadata.Batch, error) {
-	batchCalculator := batch.NewBatchCalculator(srcInfo, cv.RowsPerBatch)
+	batchCalculator := NewBatchCalculator(srcInfo, cv.RowsPerBatch)
 	batches, err := batchCalculator.CalculateBatches()
 	if err != nil {
 		return nil, fmt.Errorf("failed to calculate batches: %w", err)
@@ -184,36 +192,38 @@ func (cv *ChecksumValidator) calculateBatches(srcInfo *metadata.TableInfo) ([]me
 // processBatchesConcurrently calculates checksums, compares, saves results, and returns summaries.
 func (cv *ChecksumValidator) processBatchesConcurrently(srcInfo *metadata.TableInfo, batches []metadata.Batch) ([]BatchComparisonSummary, error) {
 	var eg errgroup.Group
-	eg.SetLimit(cv.concurrency)
+	eg.SetLimit(cv.Concurrency)
 	resultsChan := make(chan BatchComparisonSummary, len(batches))
 	summaries := make([]BatchComparisonSummary, 0, len(batches))
 	columns := srcInfo.Columns
-	srcProvider := metadata.NewDBConnProvider(cv.SrcConfig)       // Assuming DBConnProvider doesn't need logger yet
-	targetProvider := metadata.NewDBConnProvider(cv.TargetConfig) // Assuming DBConnProvider doesn't need logger yet
 
 	log.Info().Int("batch_count", len(batches)).
-		Int("concurrency", cv.concurrency).
+		Int("Concurrency", cv.Concurrency).
 		Msg("Starting concurrent batch processing")
 
 	for _, p := range batches {
-		part := p                                                                                     // Capture loop variable
-		pcc := batch.NewBatchChecksumCalculator(&part, cv.CalcCRC32InDB, srcProvider, targetProvider) // Assuming BatchChecksumCalculator doesn't need logger yet
+		part := p                                                                                             // Capture loop variable
+		pcc := NewBatchChecksumCalculator(&part, cv.CalcCRC32InDB, cv.SrcConnProvider, cv.TargetConnProvider) // Assuming BatchChecksumCalculator doesn't need logger yet
 		eg.Go(func() error {
-			log.Debug().Int("batch_index", part.Index).
-				Msg("Starting batch processing")
+			log.Debug().Int("batch_index", part.Index).Msg("Starting batch processing")
 			var checksumInfo = pcc.CalculateAndCompareChecksum(columns) // Assuming CalculateAndCompareChecksum doesn't need logger yet
-			cv.saveBatchResultToDB(part.Index, checksumInfo)
-
-			resultsChan <- BatchComparisonSummary{
+			cv.saveBatchResultToDB(part.Index, checksumInfo)            // FIXME 这个地方不应该记录全部信息，应该记录summary信息。
+			retryRowsMap := cv.buildRetryRowsMap(checksumInfo)
+			batchSummary := BatchComparisonSummary{
 				Index:         part.Index,
 				Match:         checksumInfo.IsOverallMatch(),
 				ChecksumMatch: checksumInfo.IsChecksumMatch(),
 				RowCountMatch: checksumInfo.IsRowCountMatch(),
+				RetryRowMap:   retryRowsMap,
 				SourceErr:     checksumInfo.SrcErr,
 				TargetErr:     checksumInfo.TargetErr,
 			}
-			log.Info().Int("batch_index", part.Index).
-				Msg("Finished batch processing")
+			resultsChan <- batchSummary
+			if !batchSummary.ChecksumMatch {
+				cv.RetryQueue.Enqueue(retryRowsMap)
+			}
+
+			log.Info().Int("batch_index", part.Index).Msg("Finished batch processing")
 			// Propagate errors from CalculateAndCompareChecksum if necessary (currently handled in BatchComparisonSummary)
 			// return checksumInfo.SrcErr // Or combine errors
 			return nil // errgroup handles errors returned here
@@ -226,9 +236,8 @@ func (cv *ChecksumValidator) processBatchesConcurrently(srcInfo *metadata.TableI
 	for summary := range resultsChan {
 		summaries = append(summaries, summary)
 	}
-	log.Info().Int("processed_count", len(summaries)).
-		Msg("Finished processing all batches")
 
+	log.Info().Int("processed_count", len(summaries)).Msg("Finished processing all batches")
 	if groupErr != nil {
 		log.Error().Err(groupErr).Msg("Error occurred during concurrent batch processing")
 	}
@@ -237,18 +246,28 @@ func (cv *ChecksumValidator) processBatchesConcurrently(srcInfo *metadata.TableI
 	return summaries, groupErr
 }
 
+func (cv *ChecksumValidator) buildRetryRowsMap(checksumInfo *BatchChecksumInfo) map[int64]*RetryCheckRow {
+	inconsistentPKeys := checksumInfo.CompareChecksumMap()
+	retryRowsMap := make(map[int64]*RetryCheckRow, len(inconsistentPKeys))
+	for _, pkey := range inconsistentPKeys {
+		retryRowsMap[pkey] = &RetryCheckRow{
+			PKey:           pkey,
+			RetryTimes:     &atomic.Int32{},
+			lastCheckTime:  checksumInfo.SrcCheckTime,
+			firstCheckTime: checksumInfo.SrcCheckTime,
+		}
+	}
+	return retryRowsMap
+}
+
 // saveBatchResultToDB saves the detailed batch results to the database if configured.
-func (cv *ChecksumValidator) saveBatchResultToDB(batchIndex int, checksumInfo *batch.BatchChecksumInfo) {
+func (cv *ChecksumValidator) saveBatchResultToDB(batchIndex int, checksumInfo *BatchChecksumInfo) {
 	// Log errors regardless of DB storage
 	if checksumInfo.SrcErr != nil {
-		log.Error().Int("batch_index", batchIndex).
-			Err(checksumInfo.SrcErr).
-			Msg("Batch source error")
+		log.Error().Int("batch_index", batchIndex).Err(checksumInfo.SrcErr).Msg("Batch source error")
 	}
 	if checksumInfo.TargetErr != nil {
-		log.Error().Int("batch_index", batchIndex).
-			Err(checksumInfo.TargetErr).
-			Msg("Batch target error")
+		log.Error().Int("batch_index", batchIndex).Err(checksumInfo.TargetErr).Msg("Batch target error")
 	}
 
 	// Log mismatches immediately
@@ -266,11 +285,11 @@ func (cv *ChecksumValidator) saveBatchResultToDB(batchIndex int, checksumInfo *b
 	}
 
 	// Save to DB if configured and job created
-	if cv.dbStore != nil && cv.jobID > 0 {
+	if cv.DbStore != nil && cv.JobID > 0 {
 		// ... (rest of the saveBatchResultToDB logic, converting existing log.Printf if any to cv.logger) ...
 		// Example: If there were internal logs here, convert them.
 		batchResultData := storage.BatchResultData{
-			JobID:          cv.jobID,
+			JobID:          cv.JobID,
 			BatchIndex:     batchIndex,
 			SourceChecksum: checksumInfo.SrcChecksum,
 			TargetChecksum: checksumInfo.TargetChecksum,
@@ -281,22 +300,17 @@ func (cv *ChecksumValidator) saveBatchResultToDB(batchIndex int, checksumInfo *b
 			SourceError:    errorToString(checksumInfo.SrcErr),
 			TargetError:    errorToString(checksumInfo.TargetErr),
 		}
-		dbErr := cv.dbStore.SaveBatchResult(batchResultData)
+		dbErr := cv.DbStore.SaveBatchResult(batchResultData)
 
 		if dbErr != nil {
-			log.Error().Int64("job_id", cv.jobID).
-				Int("batch_index", batchIndex).
-				Err(dbErr).
-				Msg("Failed to save batch result to database")
+			log.Error().Int64("job_id", cv.JobID).Int("batch_index", batchIndex).Err(dbErr).Msg("Failed to save batch result to database")
 		} else {
-			log.Debug().Int64("job_id", cv.jobID).
-				Int("batch_index", batchIndex).
-				Msg("Saved batch result to database")
+			log.Debug().Int64("job_id", cv.JobID).Int("batch_index", batchIndex).Msg("Saved batch result to database")
 		}
 	} else {
-		log.Debug().Int64("job_id", cv.jobID).
+		log.Debug().Int64("job_id", cv.JobID).
 			Int("batch_index", batchIndex).
-			Bool("db_store_nil", cv.dbStore == nil).
+			Bool("db_store_nil", cv.DbStore == nil).
 			Msg("Skipping DB save for batch result")
 	}
 }
@@ -345,15 +359,15 @@ func (cv *ChecksumValidator) Run() (finalResult *CompareChecksumResults, finalEr
 		cv.updateJobStatus(finalResult, finalError)
 		// Maybe add a final log summarizing the run outcome based on finalError and finalResult.Match
 		if finalError != nil {
-			log.Error().Int64("job_id", cv.jobID).Err(finalError).
+			log.Error().Int64("job_id", cv.JobID).Err(finalError).
 				Msg("Validation run finished with error")
 		} else if finalResult != nil && !finalResult.Match {
-			log.Warn().Int64("job_id", cv.jobID).
+			log.Warn().Int64("job_id", cv.JobID).
 				Int("mismatched_batches", len(finalResult.MismatchBatches)).
 				Msg("Validation run finished with mismatches")
 		} else {
 			log.Info().Bool("match", finalResult.Match).
-				Int64("job_id", cv.jobID).
+				Int64("job_id", cv.JobID).
 				Msg("Validation run finished successfully")
 		}
 	}()
@@ -365,9 +379,7 @@ func (cv *ChecksumValidator) Run() (finalResult *CompareChecksumResults, finalEr
 	}
 
 	// --- Metadata Setup ---
-	srcConnProvider := metadata.NewDBConnProvider(cv.SrcConfig)
-	targetConnProvider := metadata.NewDBConnProvider(cv.TargetConfig)
-	srcInfo, targetInfo, metaErr := cv.setupMetadata(srcConnProvider, targetConnProvider)
+	srcInfo, targetInfo, metaErr := cv.setupMetadata()
 	if metaErr != nil {
 		log.Error().Err(metaErr).Msg("Metadata setup failed")
 		finalError = fmt.Errorf("metadata setup failed: %w", metaErr)
@@ -404,6 +416,24 @@ func (cv *ChecksumValidator) Run() (finalResult *CompareChecksumResults, finalEr
 	log.Info().Int("count", len(batchSummaries)).Msg("Aggregating batch results")
 	cv.aggregateBatchResults(batchSummaries, finalResult)
 	return finalResult, finalError
+}
+
+func (cv *ChecksumValidator) RetryChecksum() {
+	_retryRowMap, err := cv.RetryQueue.Dequeue()
+	if err != nil {
+
+	}
+	retryRowMap := _retryRowMap.(map[int64]*RetryCheckRow)
+
+	// TODO 待重试的batch中失败的row可能比较少，尝试合并之
+
+	// FIXME checksum中间发生了DDL，需要直接失败，怎么检测呢？
+	srcTableInfo, err := cv.SrcTableMetaProvider.QueryTableInfo(cv.TableName)
+	rowChecksum := NewRowChecksum(retryRowMap, srcTableInfo, cv.SrcConnProvider, cv.TargetConnProvider, cv.CalcCRC32InDB)
+	newRetryRowMap, err := rowChecksum.CalculateAndCompareChecksum(srcTableInfo.Columns)
+	if len(newRetryRowMap) != 0 {
+		cv.RetryQueue.Enqueue(newRetryRowMap)
+	}
 }
 
 // Helper function to compare string slices

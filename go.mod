@@ -6,6 +6,7 @@ toolchain go1.23.8
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
+	github.com/enriquebris/goconcurrentqueue v0.7.0
 	github.com/go-sql-driver/mysql v1.9.1
 	github.com/jessevdk/go-flags v1.6.1
 	github.com/rs/zerolog v1.34.0
