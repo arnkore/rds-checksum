@@ -17,28 +17,29 @@ import (
 
 type Options struct {
 	// --- Flags for Source DB ---
-	SourceUser     string `long:"source-user" description:"Username for source database" required:"true"`
-	SourcePassword string `long:"source-password" description:"Password for source database" required:"true"`
-	SourceHost     string `long:"source-host" description:"Hostname for source database" required:"true"`
-	SourcePort     int    `long:"source-port" description:"Port for source database" required:"true"`
-	SourceDB       string `long:"source-db" description:"Database name for source database" required:"true"`
+	SourceUser     string `long:"source_user" description:"Username for source database" required:"true"`
+	SourcePassword string `long:"source_password" description:"Password for source database" required:"true"`
+	SourceHost     string `long:"source_host" description:"Hostname for source database" required:"true"`
+	SourcePort     int    `long:"source_port" description:"Port for source database" required:"true"`
+	SourceDB       string `long:"source_db" description:"Database name for source database" required:"true"`
 	// --- Flags for Target DB ---
-	TargetUser     string `long:"target-user" description:"Username for target database" required:"true"`
-	TargetPassword string `long:"target-password" description:"Password for target database" required:"true"`
-	TargetHost     string `long:"target-host" description:"Hostname for target database" required:"true"`
-	TargetPort     int    `long:"target-port" description:"Port for target database" required:"true"`
-	TargetDB       string `long:"target-db" description:"Database name for target database" required:"true"`
+	TargetUser     string `long:"target_user" description:"Username for target database" required:"true"`
+	TargetPassword string `long:"target_password" description:"Password for target database" required:"true"`
+	TargetHost     string `long:"target_host" description:"Hostname for target database" required:"true"`
+	TargetPort     int    `long:"target_port" description:"Port for target database" required:"true"`
+	TargetDB       string `long:"target_db" description:"Database name for target database" required:"true"`
 	// --- Flags for Results DB ---
-	ResultUser     string `long:"result-user" description:"Username for result database" required:"true"`
-	ResultPassword string `long:"result-password" description:"Password for result database" required:"true"`
-	ResultHost     string `long:"result-host" description:"Hostname for result database" required:"true"`
-	ResultPort     int    `long:"result-port" description:"Port for result database" required:"true"`
-	ResultDB       string `long:"result-db" description:"Database name for result database" required:"true"`
+	ResultUser     string `long:"result_user" description:"Username for result database" required:"true"`
+	ResultPassword string `long:"result_password" description:"Password for result database" required:"true"`
+	ResultHost     string `long:"result_host" description:"Hostname for result database" required:"true"`
+	ResultPort     int    `long:"result_port" description:"Port for result database" required:"true"`
+	ResultDB       string `long:"result_db" description:"Database name for result database" required:"true"`
 
-	TableName       string `long:"table-name" description:"Name of the table to validate" required:"true"`
-	RowsPerBatch    int    `long:"rows-per-batch" default:"100000" description:"Target number of rows to process in each batch/batch" required:"false"`
+	TableName       string `long:"table_name" description:"Name of the table to validate" required:"true"`
+	RowsPerBatch    int    `long:"rows_per_batch" default:"100000" description:"Target number of rows to process in each batch/batch" required:"false"`
 	ConcurrentLimit int    `long:"concurrent_limit" default:"10" description:"Number of tasks to concurrently processing" required:"false"`
-	LogFile         string `long:"log-file" description:"Path to the log file. If not specified, logs only to console." required:"false"`
+	CalcCrc32InDB   bool   `long:"calc_crc32_in_db" description:"Calculate checksum in MySQL using CRC32 function" required:"false"`
+	LogFile         string `long:"log_file" description:"Path to the log file. If not specified, logs only to console." required:"false"`
 }
 
 func main() {
@@ -76,7 +77,7 @@ func main() {
 		Msg("Starting checksum validation")
 	srcConfig := metadata.NewConfig(opts.SourceHost, opts.SourcePort, opts.SourceUser, opts.SourcePassword, opts.SourceDB)
 	targetConfig := metadata.NewConfig(opts.TargetHost, opts.TargetPort, opts.TargetUser, opts.TargetPassword, opts.TargetDB)
-	validator := checksum.NewChecksumValidator(srcConfig, targetConfig, opts.TableName, opts.RowsPerBatch, opts.ConcurrentLimit, dbStore)
+	validator := checksum.NewChecksumValidator(srcConfig, targetConfig, opts.TableName, opts.RowsPerBatch, opts.ConcurrentLimit, opts.CalcCrc32InDB, dbStore)
 	result, runErr := validator.Run()
 
 	// --- Handle Results ---
@@ -98,7 +99,7 @@ func main() {
 	os.Exit(0)
 }
 
-func processFlags() Options {
+func processFlags() *Options {
 	var opts Options
 	parser := flags.NewParser(&opts, flags.Default)
 	_, err := parser.Parse()
@@ -107,7 +108,7 @@ func processFlags() Options {
 		fmt.Fprintf(os.Stderr, "error parsing flags: %v\n", err)
 		os.Exit(1)
 	}
-	return opts
+	return &opts
 }
 
 func setupLogger(logFile string) {

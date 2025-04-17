@@ -91,10 +91,10 @@ func (s *Store) UpdateJobCompletion(jobID int64, status string, overallMatch boo
 type BatchResultData struct {
 	JobID          int64
 	BatchIndex     int
-	SourceChecksum string
-	TargetChecksum string
-	SourceRowCount int64
-	TargetRowCount int64
+	SourceChecksum uint32
+	TargetChecksum uint32
+	SourceRowCount int
+	TargetRowCount int
 	ChecksumMatch  bool
 	RowCountMatch  bool
 	SourceError    string
@@ -112,10 +112,10 @@ func (s *Store) SaveBatchResult(data BatchResultData) error {
 	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	comparisonTime := time.Now()
 	_, err := s.db.Exec(query, data.JobID, data.BatchIndex,
-		sql.NullString{String: data.SourceChecksum, Valid: data.SourceChecksum != ""},
-		sql.NullString{String: data.TargetChecksum, Valid: data.TargetChecksum != ""},
-		sql.NullInt64{Int64: data.SourceRowCount, Valid: true},
-		sql.NullInt64{Int64: data.TargetRowCount, Valid: true},
+		sql.NullInt64{Int64: int64(data.SourceChecksum), Valid: true},
+		sql.NullInt64{Int64: int64(data.TargetChecksum), Valid: true},
+		sql.NullInt32{Int32: int32(data.SourceRowCount), Valid: true},
+		sql.NullInt32{Int32: int32(data.TargetRowCount), Valid: true},
 		data.ChecksumMatch, data.RowCountMatch,
 		sql.NullString{String: data.SourceError, Valid: data.SourceError != ""},
 		sql.NullString{String: data.TargetError, Valid: data.TargetError != ""},

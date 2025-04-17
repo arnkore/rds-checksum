@@ -1,11 +1,9 @@
 package batch
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"github.com/arnkore/rds-checksum/pkg/metadata"
-	"strings"
+	"github.com/arnkore/rds-checksum/pkg/utils"
 	"sync"
 )
 
@@ -13,72 +11,116 @@ type BatchChecksumCalculator struct {
 	Batch              *metadata.Batch
 	SrcConnProvider    *metadata.DbConnProvider
 	TargetConnProvider *metadata.DbConnProvider
+	CalcCRC32InDB      bool
 }
 
-func NewBatchChecksumCalculator(batch *metadata.Batch, srcConnProvider, targetConnProvider *metadata.DbConnProvider) *BatchChecksumCalculator {
-	return &BatchChecksumCalculator{Batch: batch, SrcConnProvider: srcConnProvider, TargetConnProvider: targetConnProvider}
+func NewBatchChecksumCalculator(batch *metadata.Batch, calcCrc32InDb bool, srcConnProvider, targetConnProvider *metadata.DbConnProvider) *BatchChecksumCalculator {
+	return &BatchChecksumCalculator{Batch: batch, CalcCRC32InDB: calcCrc32InDb, SrcConnProvider: srcConnProvider, TargetConnProvider: targetConnProvider}
 }
 
-func (p *BatchChecksumCalculator) calculateSourceChecksum(columns []string) (string, int64, error) {
+func (p *BatchChecksumCalculator) CalculateSourceChecksum(columns []string) (int, uint32, error) {
 	return p.calculateChecksum(p.SrcConnProvider, columns)
 }
 
-func (p *BatchChecksumCalculator) calculateTargetChecksum(columns []string) (string, int64, error) {
+func (p *BatchChecksumCalculator) CalculateTargetChecksum(columns []string) (int, uint32, error) {
 	return p.calculateChecksum(p.TargetConnProvider, columns)
 }
 
-// calculateChecksum calculates the checksum for the batch.
-func (p *BatchChecksumCalculator) calculateChecksum(connProvider *metadata.DbConnProvider, columns []string) (string, int64, error) {
+func (p *BatchChecksumCalculator) calculateChecksum(connProvider *metadata.DbConnProvider, columns []string) (int, uint32, error) {
+	var rowCount int
+	var bitXorOfChecksum uint32
+	var err error
+
+	if p.CalcCRC32InDB {
+		rowCount, bitXorOfChecksum, _, err = p.calculateChecksumInDB(connProvider, columns)
+	} else {
+		rowCount, bitXorOfChecksum, _, err = p.calculateChecksumOutOfDB(connProvider, columns)
+	}
+	return rowCount, bitXorOfChecksum, err
+}
+
+// calculateChecksumOutOfDB calculates the checksum for the batch.
+func (p *BatchChecksumCalculator) calculateChecksumOutOfDB(connProvider *metadata.DbConnProvider, columns []string) (int, uint32, map[int64]uint32, error) {
 	dbConn, err := connProvider.CreateDbConn()
-	defer connProvider.Close(dbConn)
-	colList := "CONCAT_WS(', ', `" + strings.Join(columns, "`,`") + "`) as concatenated_columns"
-	pkCol := "`" + p.Batch.TableInfo.PrimaryKey + "`"
-	// Ensure StartPK and EndPK are handled correctly based on their actual type (e.g., int64)
-	query := fmt.Sprintf("SELECT %s, %s FROM `%s` WHERE %s >= ? AND %s <= ? ORDER BY %s",
-		pkCol, colList, p.Batch.TableInfo.TableName, pkCol, pkCol, pkCol) // ORDER BY PK is crucial
-	rows, err := dbConn.Query(query, p.Batch.GetStart(), p.Batch.GetEnd())
 	if err != nil {
-		return "", 0, fmt.Errorf("batch %d: failed to query rows (PK >= %v AND PK <= %v): %w",
+		return 0, 0, nil, fmt.Errorf("batch %d: failed to create DB connection: %w", p.Batch.Index, err)
+	}
+	defer connProvider.Close(dbConn)
+
+	concateAllColumns := utils.ConcateQuotedColumns(columns)
+	pkCol := "`" + p.Batch.TableInfo.PrimaryKey + "`"
+	// Query to calculate pk and CONCAT_WS(all_columns) in the database
+	queryTemplate := fmt.Sprintf("SELECT %s, CONCAT_WS(',', %s) FROM `%s` WHERE %s >= ? AND %s <= ?",
+		pkCol, concateAllColumns, p.Batch.TableInfo.TableName, pkCol, pkCol)
+	rows, err := dbConn.Query(queryTemplate, p.Batch.GetStart(), p.Batch.GetEnd())
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("batch %d: failed to query checksum (PK >= %v AND PK <= %v): %w",
+			p.Batch.Index, p.Batch.GetStart(), p.Batch.GetEnd(), err)
+	}
+
+	var checksumMap = make(map[int64]uint32)
+	var bitXorOfChecksum uint32 = 0
+	for rows.Next() {
+		var pkVal int64
+		var concateAllColumnsVal string
+		if err := rows.Scan(&pkVal, &concateAllColumnsVal); err != nil {
+			return 0, 0, nil, fmt.Errorf("batch %d: failed to scan row: %w", p.Batch.Index, err)
+		}
+		rowChecksum := utils.CalculateCRC32(concateAllColumnsVal)
+		checksumMap[pkVal] = rowChecksum
+		bitXorOfChecksum ^= rowChecksum
+	}
+	return len(checksumMap), bitXorOfChecksum, checksumMap, nil
+}
+
+// calculateChecksumInDB calculates the checksum for the batch using database functions.
+func (p *BatchChecksumCalculator) calculateChecksumInDB(connProvider *metadata.DbConnProvider, columns []string) (int, uint32, map[int64]uint32, error) {
+	dbConn, err := connProvider.CreateDbConn()
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("batch %d: failed to create DB connection: %w", p.Batch.Index, err)
+	}
+	defer connProvider.Close(dbConn)
+
+	concateAllColumns := utils.ConcateQuotedColumns(columns)
+	pkCol := "`" + p.Batch.TableInfo.PrimaryKey + "`"
+	// Query to calculate pk and CRC32(CONCAT_WS(all_columns)) in the database
+	queryTemplate := fmt.Sprintf("SELECT %s, CRC32(CONCAT_WS(',', %s)) FROM `%s` WHERE %s >= ? AND %s <= ?",
+		pkCol, concateAllColumns, p.Batch.TableInfo.TableName, pkCol, pkCol)
+	rows, err := dbConn.Query(queryTemplate, p.Batch.GetStart(), p.Batch.GetEnd())
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("batch %d: failed to query checksum (PK >= %v AND PK <= %v): %w",
 			p.Batch.Index, p.Batch.GetStart(), p.Batch.GetEnd(), err)
 	}
 	defer rows.Close()
 
-	batchHasher := sha256.New()
-	var rowCount int64 = 0
-	var pkVal int64 = 0
-	var concatenatedColumns string
-
+	var checksumMap = make(map[int64]uint32)
+	var bitXorOfChecksum uint32 = 0
 	for rows.Next() {
-		if err := rows.Scan(&pkVal, &concatenatedColumns); err != nil {
-			return "", 0, fmt.Errorf("batch %d: failed to scan row: %w", p.Batch.Index, err)
+		var pkVal int64
+		var checksum uint32
+		if err := rows.Scan(&pkVal, &checksum); err != nil {
+			return 0, 0, nil, fmt.Errorf("batch %d: failed to scan row: %w", p.Batch.Index, err)
 		}
-		batchHasher.Write([]byte(concatenatedColumns)) // Combine row hashes
-		rowCount++
+		checksumMap[pkVal] = checksum
+		bitXorOfChecksum ^= checksum
 	}
-
-	if err := rows.Err(); err != nil {
-		return "", 0, fmt.Errorf("batch %d: error iterating rows: %w", p.Batch.Index, err)
-	}
-
-	// Final checksum for the batch is the hash of concatenated row hashes
-	finalChecksum := hex.EncodeToString(batchHasher.Sum(nil))
-	return finalChecksum, rowCount, nil
+	return len(checksumMap), bitXorOfChecksum, checksumMap, nil
 }
 
 func (p *BatchChecksumCalculator) CalculateAndCompareChecksum(columns []string) *BatchChecksumInfo {
-	var srcBatchChecksum, targetBatchChecksum string
-	var srcBatchRowCount, targetBatchRowCount int64
+	var srcBatchChecksum, targetBatchChecksum uint32
+	var srcBatchRowCount, targetBatchRowCount int
 	var srcErr, targetErr error
 	var wgPart sync.WaitGroup
 	wgPart.Add(2)
 
 	go func() {
 		defer wgPart.Done()
-		srcBatchChecksum, srcBatchRowCount, srcErr = p.calculateSourceChecksum(columns)
+		srcBatchRowCount, srcBatchChecksum, srcErr = p.CalculateSourceChecksum(columns)
 	}()
 	go func() {
 		defer wgPart.Done()
-		targetBatchChecksum, targetBatchRowCount, targetErr = p.calculateTargetChecksum(columns)
+		targetBatchRowCount, targetBatchChecksum, targetErr = p.CalculateTargetChecksum(columns)
 	}()
 	wgPart.Wait()
 
@@ -94,13 +136,15 @@ func (p *BatchChecksumCalculator) CalculateAndCompareChecksum(columns []string) 
 }
 
 type BatchChecksumInfo struct {
-	Index          int
-	SrcChecksum    string
-	TargetChecksum string
-	SrcRowCount    int64
-	TargetRowCount int64
-	SrcErr         error
-	TargetErr      error
+	Index             int
+	SrcChecksum       uint32
+	TargetChecksum    uint32
+	SrcRowCount       int
+	TargetRowCount    int
+	SrcChecksumMap    map[int64]uint32
+	TargetChecksumMap map[int64]uint32
+	SrcErr            error
+	TargetErr         error
 }
 
 func (p *BatchChecksumInfo) IsRowCountMatch() bool {
@@ -108,7 +152,7 @@ func (p *BatchChecksumInfo) IsRowCountMatch() bool {
 }
 
 func (p *BatchChecksumInfo) IsChecksumMatch() bool {
-	return p.SrcChecksum == p.SrcChecksum
+	return p.SrcChecksum == p.TargetChecksum
 }
 
 func (p *BatchChecksumInfo) IsOverallMatch() bool {
