@@ -2,6 +2,7 @@ package checksum
 
 import (
 	"fmt"
+	"github.com/arnkore/rds-checksum/pkg/common"
 	"github.com/rs/zerolog/log"
 	"sort"
 	"sync"
@@ -12,18 +13,6 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"golang.org/x/sync/errgroup"
-)
-
-// JobStatus defines the possible statuses for a checksum job.
-type JobStatus string
-
-const (
-	JobStatusPending           JobStatus = "pending"
-	JobStatusRunning           JobStatus = "running"
-	JobStatusCompleted         JobStatus = "completed"
-	JobStatusCompletedMismatch JobStatus = "completed_mismatch"
-	JobStatusFailed            JobStatus = "failed"
-	// Add other potential statuses here if needed
 )
 
 // CompareChecksumResults compares checksum results from two sources (e.g., master and replica).
@@ -79,19 +68,19 @@ type BatchComparisonSummary struct {
 
 // updateJobStatus updates the job status in the database.
 func (v *ChecksumValidator) updateJobStatus(comparisonResult *CompareChecksumResults, finalError error) {
-	var status JobStatus // Use the enum type
+	var status common.JobStatus // Use the enum type
 	errMsg := ""
 	mismatchedCount := 0
 
 	// Determine status based on comparisonResult and finalError
 	if finalError != nil {
-		status = JobStatusFailed
+		status = common.JobStatusFailed
 		errMsg = finalError.Error() // Capture the final error message
 	} else if comparisonResult != nil {
 		if comparisonResult.Match {
-			status = JobStatusCompleted
+			status = common.JobStatusCompleted
 		} else {
-			status = JobStatusCompletedMismatch
+			status = common.JobStatusCompletedMismatch
 		}
 		mismatchedCount = len(comparisonResult.MismatchBatches)
 		// Capture specific errors if finalError was nil but comparison had issues
@@ -103,7 +92,7 @@ func (v *ChecksumValidator) updateJobStatus(comparisonResult *CompareChecksumRes
 		}
 	} else {
 		// This case should ideally be covered by finalError, but as a fallback:
-		status = JobStatusFailed
+		status = common.JobStatusFailed
 		errMsg = "Unknown early failure, comparison result is nil"
 		finalError = fmt.Errorf(errMsg) // Ensure finalError reflects this state
 	}

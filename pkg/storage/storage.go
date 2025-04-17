@@ -3,6 +3,7 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"github.com/arnkore/rds-checksum/pkg/common"
 	"time"
 	// Add other necessary imports like "errors" if needed
 )
@@ -58,7 +59,7 @@ CREATE TABLE IF NOT EXISTS batch_checksum_results (
 // CreateJob inserts a new job record and returns its ID.
 func (s *Store) CreateJob(tableName string, rowsPerBatch int) (int64, error) {
 	query := `INSERT INTO checksum_jobs (table_name, rows_per_batch, status, start_time) VALUES (?, ?, ?, ?)`
-	result, err := s.db.Exec(query, tableName, rowsPerBatch, "running", time.Now())
+	result, err := s.db.Exec(query, tableName, rowsPerBatch, common.JobStatusRunning, time.Now())
 	if err != nil {
 		return 0, fmt.Errorf("failed to insert new job: %w", err)
 	}
