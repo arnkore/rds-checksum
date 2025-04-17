@@ -111,18 +111,22 @@ func processFlags() Options {
 }
 
 func setupLogger(logFile string) {
-	var logWriter io.Writer = zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339Nano} // Default to pretty stderr
+	var consoleWriter io.Writer = zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339Nano} // Default to pretty stderr
 	if logFile != "" {
 		logF, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
 		if err != nil {
 			log.Fatal().Err(err).Str("file", logFile).Msg("Error opening log file")
 		}
-		// Don't close logF here, let the process handle it
+		// 配置 ConsoleWriter 输出到文件
+		fileWriter := zerolog.ConsoleWriter{
+			Out:        logF,
+			TimeFormat: time.RFC3339Nano, // 带毫秒的时间格式
+			NoColor:    true,             // 禁用颜色（文件不需要）
+		}
 		// Use MultiWriter to write to both file (plain JSON) and console (pretty)
-		logWriter = zerolog.MultiLevelWriter(logWriter, logF)
+		consoleWriter = zerolog.MultiLevelWriter(consoleWriter, fileWriter)
 	}
 
-	// Configure zerolog logger
 	zerolog.TimeFieldFormat = "2006-01-02 15:04:05.000"
-	log.Logger = zerolog.New(logWriter).With().Timestamp().Logger() // Set as global logger
+	log.Logger = zerolog.New(consoleWriter).With().Timestamp().Logger() // Set as global logger
 }
