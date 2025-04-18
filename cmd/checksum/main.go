@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/arnkore/rds-checksum/pkg/checksum"
+	"github.com/arnkore/rds-checksum/pkg/common"
 	"github.com/arnkore/rds-checksum/pkg/metadata"
 	"github.com/arnkore/rds-checksum/pkg/storage" // Assuming storage package exists
 	"github.com/jessevdk/go-flags"
@@ -15,6 +16,10 @@ import (
 	_ "github.com/go-sql-driver/mysql" // Assuming MySQL for results DB
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+)
+
+var (
+	GET_TABLE_INFO_MAX_RETRY_TIMES = 3
 )
 
 type Options struct {
@@ -69,30 +74,33 @@ func main() {
 
 	// 非重试的checksum task是否运行结束
 	var firstRunChecksumFinished = &atomic.Bool{}
-	// 使用 context 控制取消
-	ctx, cancel := context.WithCancel(context.Background())
-	go setupChecksumRetryTask(ctx, cancel, validator, firstRunChecksumFinished)
+	var normalCancelFlag = &atomic.Bool{}
+	// 使用 context 控制是否继续重试
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	go setupChecksumRetryTask(ctx, cancelFunc, validator, firstRunChecksumFinished, normalCancelFlag)
 	result, runErr := validator.Run()
-	// --- Handle Results ---
-	jobID := validator.GetJobID() // Assume validator exposes the job ID it created
 	firstRunChecksumFinished.Store(true)
+	jobID := validator.GetJobID()
 
 	if runErr != nil {
-		// Error occurred *during* validation run (potentially after job created)
-		log.Error().Err(runErr).Int64("job_id", jobID).Msg("Validation job run failed and potentially incomplete")
+		log.Error().Err(runErr).Int64(common.JOB_ID_KEY, jobID).Msg("Validation job run failed and potentially incomplete")
 		// FIXME 有报错，要尝试重试，而不是直接退出程序。
 		os.Exit(1)
 	}
 
 	// If we reached here, Run completed its process (though checksums might mismatch)
-	// Results are stored in DB, provide summary log
 	if result.Match {
-		log.Info().Int64("job_id", jobID).Msg("✅ Result: Checksums match.")
+		checksum.NormalCancel(cancelFunc, normalCancelFlag)
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
+			if normalCancelFlag.Load() {
+				log.Info().Int64(common.JOB_ID_KEY, jobID).Msg("✅ Result: Checksums match.")
+			} else {
+				log.Warn().Int64(common.JOB_ID_KEY, jobID).Msg("❌ Result: Checksums DO NOT match.")
+			}
 			return
 		}
 	}
@@ -111,7 +119,7 @@ func processFlags() *Options {
 }
 
 func setupLogger(logFile string) {
-	var consoleWriter io.Writer = zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339Nano} // Default to pretty stderr
+	var logWriter io.Writer = zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339Nano} // Default to pretty stderr
 	if logFile != "" {
 		logF, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
 		if err != nil {
@@ -124,12 +132,12 @@ func setupLogger(logFile string) {
 			NoColor:    true,             // 禁用颜色（文件不需要）
 		}
 		// Use MultiWriter to write to both file (plain JSON) and console (pretty)
-		consoleWriter = zerolog.MultiLevelWriter(consoleWriter, fileWriter)
+		logWriter = zerolog.MultiLevelWriter(logWriter, fileWriter)
 	}
 
 	zerolog.TimeFieldFormat = "2006-01-02 15:04:05.000"
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	log.Logger = zerolog.New(consoleWriter).With().Timestamp().Logger() // Set as global logger
+	log.Logger = zerolog.New(logWriter).With().Timestamp().Logger() // Set as global logger
 }
 
 func setUpStorage(opts *Options) *storage.Store {
@@ -149,18 +157,38 @@ func setUpStorage(opts *Options) *storage.Store {
 	return dbStore
 }
 
-func setupChecksumRetryTask(ctx context.Context, cancel context.CancelFunc, validator *checksum.ChecksumValidator,
-	firstRunChecksumFinished *atomic.Bool) {
-	// 每3秒触发一次
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop() // 确保停止 ticker，防止资源泄漏
+func setupChecksumRetryTask(ctx context.Context, cancelFunc context.CancelFunc, validator *checksum.ChecksumValidator,
+	firstRunChecksumFinished, normalCancelFlag *atomic.Bool) {
+	ticker := time.NewTicker(common.CHECKSUM_RETRY_INTERVAL)
+	defer ticker.Stop()
+
+	srcTableInfo := getSrcTableInfo(validator)
+	if srcTableInfo == nil {
+		checksum.AbnormalCancel(cancelFunc, normalCancelFlag)
+		return
+	}
 
 	for {
 		select {
 		case <-ticker.C:
-			validator.RetryChecksum(cancel, firstRunChecksumFinished)
+			validator.RetryRowChecksum(cancelFunc, firstRunChecksumFinished, normalCancelFlag, srcTableInfo)
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+func getSrcTableInfo(validator *checksum.ChecksumValidator) *metadata.TableInfo {
+	var srcTableInfo *metadata.TableInfo
+	var err error
+	for i := 0; i < GET_TABLE_INFO_MAX_RETRY_TIMES; i++ {
+		srcTableInfo, err = validator.GetSrcTableMetaProvider().QueryTableInfo(validator.TableName)
+		if err != nil {
+			log.Error().Err(err).Str("table", validator.TableName).Msg("Failed to get source table info")
+			if i == GET_TABLE_INFO_MAX_RETRY_TIMES-1 {
+				return nil
+			}
+		}
+	}
+	return srcTableInfo
 }

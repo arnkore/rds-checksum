@@ -64,6 +64,10 @@ func NewChecksumValidator(srcConfig, targetConfig *metadata.Config, tableName st
 	}
 }
 
+func (v *ChecksumValidator) GetSrcTableMetaProvider() *metadata.TableMetaProvider {
+	return v.SrcTableMetaProvider
+}
+
 // GetJobID returns the database job ID associated with this validation run.
 func (cv *ChecksumValidator) GetJobID() int64 {
 	return cv.JobID
@@ -420,39 +424,33 @@ func (cv *ChecksumValidator) Run() (finalResult *CompareChecksumResults, finalEr
 	return finalResult, finalError
 }
 
-func (cv *ChecksumValidator) RetryChecksum(cancel context.CancelFunc, firstRunChecksumFinished *atomic.Bool) {
+func (cv *ChecksumValidator) RetryRowChecksum(cancelFunc context.CancelFunc, firstRunChecksumFinished, normalCancelFlag *atomic.Bool, srcTableInfo *metadata.TableInfo) {
 	firstRunFinished := firstRunChecksumFinished.Load()
 	_retryRowMap, err := cv.RetryQueue.Dequeue()
 	if err != nil {
 		if isQueueEmpty(err) {
 			if firstRunFinished {
-				log.Info().Msg("Retry_queue is empty and first run finished, stopping retry process.")
-				cancel()
+				log.Info().Msg("RetryQueue is empty and first run finished, stopping retry process.")
+				NormalCancel(cancelFunc, normalCancelFlag)
 			}
-			return
 		} else if cv.RetryQueue.IsLocked() {
-			log.Error().Err(err).Msg("Queue is locked, stopping retry process.")
-			cancel()
+			log.Error().Err(err).Msg("RetryQueue is locked, stopping retry process.")
+			AbnormalCancel(cancelFunc, normalCancelFlag)
 		}
+		return
 	}
 
 	retryRowMap, ok := _retryRowMap.(map[int64]*RetryCheckRow)
 	if !ok {
 		log.Error().Interface("dequeued_item", _retryRowMap).
 			Msg("Dequeued item is not of expected type map[int64]*RetryCheckRow")
+		AbnormalCancel(cancelFunc, normalCancelFlag)
 		return // Skip processing invalid item
 	}
 
 	log.Info().Int("retry_rows_count", len(retryRowMap)).Msg("Dequeued rows for retry check")
 	// TODO 待重试的batch中失败的row可能比较少，尝试合并之
 	// FIXME checksum中间发生了DDL，需要直接失败，怎么检测呢？
-
-	srcTableInfo, err := cv.SrcTableMetaProvider.QueryTableInfo(cv.TableName)
-	if err != nil { // Added error handling and log
-		log.Error().Err(err).Str("table", cv.TableName).Msg("Failed to get source table info during retry")
-		// FIXME 达到最大重试次数，退出queue
-		return
-	}
 
 	rowChecksum := NewRowChecksum(retryRowMap, srcTableInfo, cv.SrcConnProvider, cv.TargetConnProvider, cv.CalcCRC32InDB)
 	newRetryRowMap, checksumErr := rowChecksum.CalculateAndCompareChecksum(srcTableInfo.Columns)
@@ -466,16 +464,42 @@ func (cv *ChecksumValidator) RetryChecksum(cancel context.CancelFunc, firstRunCh
 		log.Warn().Int("new_retry_count", len(newRetryRowMap)).
 			Int("original_count", len(retryRowMap)).
 			Msg("Some rows still mismatched after retry, re-enqueuing")
+		
+		if retryCheck(newRetryRowMap) { // 达到最大重试次数，退出重试任务。
+			log.Warn().Msg("Some rows are still mismatched after retry 2 times, stopping retry process.")
+			AbnormalCancel(cancelFunc, normalCancelFlag)
+			return
+		}
 		enqueueErr := cv.RetryQueue.Enqueue(newRetryRowMap)
 		if enqueueErr != nil {
 			log.Error().Err(enqueueErr).
 				Int("row_count", len(newRetryRowMap)).
 				Msg("Failed to re-enqueue rows for retry")
+			AbnormalCancel(cancelFunc, normalCancelFlag)
 		}
 	} else if checksumErr == nil { // Only log success if there wasn't a calculation error
 		log.Info().Int("checked_count", len(retryRowMap)).
 			Msg("Successfully retried and verified rows, no mismatches found in this batch.")
 	}
+}
+
+func retryCheck(retryMap map[int64]*RetryCheckRow) bool {
+	for _, v := range retryMap {
+		if v.RetryTimes.Load() >= common.ROW_CHECKSUM_MAX_RETRY_TIMES {
+			return true
+		}
+	}
+	return false
+}
+
+func NormalCancel(cancelFunc context.CancelFunc, normalCancelFlag *atomic.Bool) {
+	cancelFunc()
+	normalCancelFlag.Store(true)
+}
+
+func AbnormalCancel(cancelFunc context.CancelFunc, normalCancelFlag *atomic.Bool) {
+	cancelFunc()
+	normalCancelFlag.Store(false)
 }
 
 func isQueueEmpty(err error) bool {

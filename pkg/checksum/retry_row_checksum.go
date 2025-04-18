@@ -81,7 +81,7 @@ func (rc *RowChecksum) CalculateAndCompareChecksum(columns []string) (map[int64]
 	retryRowsMap := make(map[int64]*RetryCheckRow, len(inconsistentPKeys))
 	for _, pkey := range inconsistentPKeys {
 		oldRetryRow := rc.RetryRowMap[pkey]
-		oldRetryRow.RetryTimes.And(1)
+		oldRetryRow.RetryTimes.Add(1)
 		oldRetryRow.lastCheckTime = &srcCheckTime
 		retryRowsMap[pkey] = oldRetryRow
 	}
