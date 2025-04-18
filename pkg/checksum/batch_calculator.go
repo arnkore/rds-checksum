@@ -3,6 +3,7 @@ package checksum
 import (
 	"fmt"
 	"github.com/arnkore/rds-checksum/pkg/metadata"
+	log "github.com/sirupsen/logrus"
 )
 
 // BatchCalculator determines how to divide a table into batches.
@@ -61,7 +62,11 @@ func (pc *BatchCalculator) CalculateBatches() ([]metadata.Batch, error) {
 		lastBatch := batches[len(batches)-1]
 		if lastPK := lastBatch.PKRange.GetEnd(); lastPK != tablePKRange.GetEnd() {
 			// This might indicate a logic error or edge case not handled
-			fmt.Printf("Warning: Last batch end PK %d does not match max PK %d for table %s\n", lastPK, tablePKRange.GetEnd(), pc.TableInfo.TableName)
+			log.WithFields(log.Fields{
+				"last_batch_end_pk": lastPK,
+				"table_max_pk":      tablePKRange.GetEnd(),
+				"table_name":        pc.TableInfo.TableName,
+			}).Warn("Last batch end PK does not match max PK for table")
 		}
 	} else if pc.TableInfo.RowCount > 0 {
 		// If we have rows but generated no batches, something is wrong

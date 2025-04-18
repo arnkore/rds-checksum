@@ -9,7 +9,7 @@ import (
 	"github.com/arnkore/rds-checksum/pkg/storage" // Added storage import
 	"github.com/enriquebris/goconcurrentqueue"
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/rs/zerolog/log"
+	log "github.com/sirupsen/logrus" // Changed from zerolog/log
 	"golang.org/x/sync/errgroup"
 	"sort"
 	"sync"
@@ -124,19 +124,20 @@ func (cv *ChecksumValidator) updateJobStatus(comparisonResult *CompareChecksumRe
 		tgtRows = comparisonResult.TargetTotalRows
 	}
 
-	// Use slog for structured logging
-	log.Info().Int64("job_id", cv.JobID).
-		Str("status", string(status)).
-		Bool("match", matchStatus).
-		Int64("source_rows", srcRows).
-		Int64("target_rows", tgtRows).
-		Int("mismatched_batches", mismatchedCount).
-		Str("error_message", errMsg).
-		Msg("Attempting to update job status")
+	// Use logrus for structured logging
+	log.WithFields(log.Fields{
+		"job_id":             cv.JobID,
+		"status":             status,
+		"match":              matchStatus,
+		"source_rows":        srcRows,
+		"target_rows":        tgtRows,
+		"mismatched_batches": mismatchedCount,
+		"error_message":      errMsg,
+	}).Info("Attempting to update job status")
 	// Convert enum back to string for the database layer
 	err := cv.DbStore.UpdateJobCompletion(cv.JobID, string(status), matchStatus, srcRows, tgtRows, mismatchedCount, errMsg)
 	if err != nil {
-		log.Error().Int64("job_id", cv.JobID).Err(err).Msg("Failed to update final job status")
+		log.WithField("job_id", cv.JobID).WithError(err).Error("Failed to update final job status")
 	}
 }
 
@@ -191,7 +192,7 @@ func (cv *ChecksumValidator) calculateBatches(srcInfo *metadata.TableInfo) ([]me
 	if err != nil {
 		return nil, fmt.Errorf("failed to calculate batches: %w", err)
 	}
-	log.Info().Int("count", len(batches)).Str("table", cv.TableName).Msg("Calculated batches")
+	log.WithFields(log.Fields{"count": len(batches), "table": cv.TableName}).Info("Calculated batches")
 	return batches, nil
 }
 
@@ -203,15 +204,13 @@ func (cv *ChecksumValidator) processBatchesConcurrently(srcInfo *metadata.TableI
 	summaries := make([]BatchComparisonSummary, 0, len(batches))
 	columns := srcInfo.Columns
 
-	log.Info().Int("batch_count", len(batches)).
-		Int("Concurrency", cv.Concurrency).
-		Msg("Starting concurrent batch processing")
+	log.WithFields(log.Fields{"batch_count": len(batches), "Concurrency": cv.Concurrency}).Info("Starting concurrent batch processing")
 
 	for _, p := range batches {
 		part := p                                                                                             // Capture loop variable
 		pcc := NewBatchChecksumCalculator(&part, cv.CalcCRC32InDB, cv.SrcConnProvider, cv.TargetConnProvider) // Assuming BatchChecksumCalculator doesn't need logger yet
 		eg.Go(func() error {
-			log.Debug().Int("batch_index", part.Index).Msg("Starting batch processing")
+			log.WithField("batch_index", part.Index).Debug("Starting batch processing")
 			var checksumInfo = pcc.CalculateAndCompareChecksum(columns) // Assuming CalculateAndCompareChecksum doesn't need logger yet
 			cv.saveBatchResultToDB(part.Index, checksumInfo)            // FIXME 这个地方不应该记录全部信息，应该记录summary信息。
 			retryRowsMap := cv.buildRetryRowsMap(checksumInfo)
@@ -229,7 +228,7 @@ func (cv *ChecksumValidator) processBatchesConcurrently(srcInfo *metadata.TableI
 				cv.RetryQueue.Enqueue(retryRowsMap)
 			}
 
-			log.Info().Int("batch_index", part.Index).Msg("Finished batch processing")
+			log.WithField("batch_index", part.Index).Info("Finished batch processing")
 			// Propagate errors from CalculateAndCompareChecksum if necessary (currently handled in BatchComparisonSummary)
 			// return checksumInfo.SrcErr // Or combine errors
 			return nil // errgroup handles errors returned here
@@ -243,12 +242,11 @@ func (cv *ChecksumValidator) processBatchesConcurrently(srcInfo *metadata.TableI
 		summaries = append(summaries, summary)
 	}
 
-	log.Info().Int("processed_count", len(summaries)).Msg("Finished processing all batches")
+	log.WithField("processed_count", len(summaries)).Info("Finished processing all batches")
 	if groupErr != nil {
-		log.Error().Err(groupErr).Msg("Error occurred during concurrent batch processing")
+		log.WithError(groupErr).Error("Error occurred during concurrent batch processing")
 	}
 
-	// Return summaries and the critical error from the group
 	return summaries, groupErr
 }
 
@@ -270,24 +268,26 @@ func (cv *ChecksumValidator) buildRetryRowsMap(checksumInfo *BatchChecksumInfo) 
 func (cv *ChecksumValidator) saveBatchResultToDB(batchIndex int, checksumInfo *BatchChecksumInfo) {
 	// Log errors regardless of DB storage
 	if checksumInfo.SrcErr != nil {
-		log.Error().Int("batch_index", batchIndex).Err(checksumInfo.SrcErr).Msg("Batch source error")
+		log.WithField("batch_index", batchIndex).WithError(checksumInfo.SrcErr).Error("Processing source batch error")
 	}
 	if checksumInfo.TargetErr != nil {
-		log.Error().Int("batch_index", batchIndex).Err(checksumInfo.TargetErr).Msg("Batch target error")
+		log.WithField("batch_index", batchIndex).WithError(checksumInfo.TargetErr).Error("Processing target batch error")
 	}
 
 	// Log mismatches immediately
 	if !checksumInfo.IsRowCountMatch() {
-		log.Warn().Int("batch_index", batchIndex).
-			Int("source_rows", checksumInfo.SrcRowCount).
-			Int("target_rows", checksumInfo.TargetRowCount).
-			Msg("Batch row count mismatch")
+		log.WithFields(log.Fields{
+			"batch_index": batchIndex,
+			"source_rows": checksumInfo.SrcRowCount,
+			"target_rows": checksumInfo.TargetRowCount,
+		}).Info("Batch row count mismatch")
 	} else if !checksumInfo.IsChecksumMatch() {
 		// Only log checksum mismatch if row counts matched (otherwise it's implied)
-		log.Warn().Int("batch_index", batchIndex).
-			Uint32("source_checksum", checksumInfo.SrcChecksum).
-			Uint32("target_checksum", checksumInfo.TargetChecksum).
-			Msg("Batch checksum mismatch")
+		log.WithFields(log.Fields{
+			"batch_index":     batchIndex,
+			"source_checksum": checksumInfo.SrcChecksum,
+			"target_checksum": checksumInfo.TargetChecksum,
+		}).Info("Batch checksum mismatch")
 	}
 
 	// Save to DB if configured and job created
@@ -309,15 +309,8 @@ func (cv *ChecksumValidator) saveBatchResultToDB(batchIndex int, checksumInfo *B
 		dbErr := cv.DbStore.SaveBatchResult(batchResultData)
 
 		if dbErr != nil {
-			log.Error().Int64("job_id", cv.JobID).Int("batch_index", batchIndex).Err(dbErr).Msg("Failed to save batch result to database")
-		} else {
-			log.Debug().Int64("job_id", cv.JobID).Int("batch_index", batchIndex).Msg("Saved batch result to database")
+			log.WithFields(log.Fields{"batch_index": batchIndex, "job_id": cv.JobID}).WithError(dbErr).Error("Failed to save batch result to database")
 		}
-	} else {
-		log.Debug().Int64("job_id", cv.JobID).
-			Int("batch_index", batchIndex).
-			Bool("db_store_nil", cv.DbStore == nil).
-			Msg("Skipping DB save for batch result")
 	}
 }
 
@@ -365,29 +358,25 @@ func (cv *ChecksumValidator) Run() (finalResult *CompareChecksumResults, finalEr
 		cv.updateJobStatus(finalResult, finalError)
 		// Maybe add a final log summarizing the run outcome based on finalError and finalResult.Match
 		if finalError != nil {
-			log.Error().Int64("job_id", cv.JobID).Err(finalError).
-				Msg("Validation run finished with error")
+			log.WithField("job_id", cv.JobID).WithError(finalError).Error("Validation run finished with error")
 		} else if finalResult != nil && !finalResult.Match {
-			log.Warn().Int64("job_id", cv.JobID).
-				Int("mismatched_batches", len(finalResult.MismatchBatches)).
-				Msg("Validation run finished with mismatches")
+			log.WithFields(log.Fields{"job_id": cv.JobID, "mismatched_batches": len(finalResult.MismatchBatches)}).
+				Error("Validation run finished with mismatches")
 		} else {
-			log.Info().Bool("match", finalResult.Match).
-				Int64("job_id", cv.JobID).
-				Msg("Validation run finished successfully")
+			log.WithFields(log.Fields{"job_id": cv.JobID, "match": finalResult.Match}).Info("Validation run finished successfully")
 		}
 	}()
 
 	// Create job record first
 	err := cv.createJobRecord()
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to create checksum job in database. Proceeding without DB logging.")
+		log.WithError(err).Error("Failed to create checksum job in database. Proceeding without DB logging.")
 	}
 
 	// --- Metadata Setup ---
 	srcInfo, targetInfo, metaErr := cv.setupMetadata()
 	if metaErr != nil {
-		log.Error().Err(metaErr).Msg("Metadata setup failed")
+		log.WithError(metaErr).Error("Metadata setup failed")
 		finalError = fmt.Errorf("metadata setup failed: %w", metaErr)
 		return finalResult, finalError // Return immediately on critical setup error
 	}
@@ -399,13 +388,12 @@ func (cv *ChecksumValidator) Run() (finalResult *CompareChecksumResults, finalEr
 	// --- Batch Calculation ---
 	batches, batchErr := cv.calculateBatches(srcInfo)
 	if batchErr != nil {
-		log.Error().Err(batchErr).Msg("Failed to calculate batches")
+		log.WithError(batchErr).Error("Failed to calculate batches")
 		finalError = fmt.Errorf("batch calculation failed: %w", batchErr) // Keep fmt for error wrapping
 		return finalResult, finalError                                    // Return immediately
 	}
 	if len(batches) == 0 {
-		log.Warn().Str("table", cv.TableName).
-			Msg("No batches calculated, possibly an empty table or configuration issue.")
+		log.WithField("table", cv.TableName).Warn("No batches calculated, possibly an empty table or configuration issue.")
 		// Consider this a success (empty tables match), or handle as needed.
 		finalResult.Match = true // Explicitly set match for empty table case
 		return finalResult, nil  // Nothing more to do
@@ -415,11 +403,11 @@ func (cv *ChecksumValidator) Run() (finalResult *CompareChecksumResults, finalEr
 	batchSummaries, processErr := cv.processBatchesConcurrently(srcInfo, batches)
 	if processErr != nil {
 		finalError = fmt.Errorf("concurrent batch processing failed: %w", processErr)
-		log.Warn().Msg("Aggregating potentially incomplete batch results due to processing error")
+		log.Warn("Aggregating potentially incomplete batch results due to processing error")
 	}
 
 	// --- Aggregate Results ---
-	log.Info().Int("count", len(batchSummaries)).Msg("Aggregating batch results")
+	log.WithField("count", len(batchSummaries)).Info("Aggregating batch results")
 	cv.aggregateBatchResults(batchSummaries, finalResult)
 	return finalResult, finalError
 }
@@ -430,11 +418,11 @@ func (cv *ChecksumValidator) RetryRowChecksum(cancelFunc context.CancelFunc, fir
 	if err != nil {
 		if isQueueEmpty(err) {
 			if firstRunFinished {
-				log.Info().Msg("RetryQueue is empty and first run finished, stopping retry process.")
+				log.Info("RetryQueue is empty and first run finished, stopping retry process.")
 				NormalCancel(cancelFunc, normalCancelFlag)
 			}
 		} else if cv.RetryQueue.IsLocked() {
-			log.Error().Err(err).Msg("RetryQueue is locked, stopping retry process.")
+			log.WithError(err).Error("RetryQueue is locked, stopping retry process.")
 			AbnormalCancel(cancelFunc, normalCancelFlag)
 		}
 		return
@@ -442,44 +430,41 @@ func (cv *ChecksumValidator) RetryRowChecksum(cancelFunc context.CancelFunc, fir
 
 	retryRowMap, ok := _retryRowMap.(map[int64]*RetryCheckRow)
 	if !ok {
-		log.Error().Interface("dequeued_item", _retryRowMap).
-			Msg("Dequeued item is not of expected type map[int64]*RetryCheckRow")
+		log.WithField("dequeued_item", _retryRowMap).Error("Dequeued item is not of expected type")
 		AbnormalCancel(cancelFunc, normalCancelFlag)
 		return // Skip processing invalid item
 	}
 
-	log.Info().Int("retry_rows_count", len(retryRowMap)).Msg("Dequeued rows for retry check")
+	log.WithField("retry_rows_count", len(retryRowMap)).Info("Dequeued rows for retry check")
 	// TODO 待重试的batch中失败的row可能比较少，尝试合并之
 	// FIXME checksum中间发生了DDL，需要直接失败，怎么检测呢？
 
 	rowChecksum := NewRowChecksum(retryRowMap, srcTableInfo, cv.SrcConnProvider, cv.TargetConnProvider, cv.CalcCRC32InDB)
 	newRetryRowMap, checksumErr := rowChecksum.CalculateAndCompareChecksum(srcTableInfo.Columns)
 	if checksumErr != nil {
-		log.Error().Err(checksumErr).
-			Int("initial_row_count", len(retryRowMap)).
-			Msg("Error during row checksum calculation/comparison")
+		log.WithField("initial_row_count", len(retryRowMap)).WithError(checksumErr).
+			Error("Error during row checksum calculation/comparison")
 	}
 
 	if len(newRetryRowMap) > 0 {
-		log.Warn().Int("new_retry_count", len(newRetryRowMap)).
-			Int("original_count", len(retryRowMap)).
-			Msg("Some rows still mismatched after retry, re-enqueuing")
-		
+		log.WithField("retry_rows_count", len(retryRowMap)).
+			WithField("new_retry_count", len(newRetryRowMap)).
+			Warn("Some rows still mismatched after retry, re-enqueuing")
+
 		if retryCheck(newRetryRowMap) { // 达到最大重试次数，退出重试任务。
-			log.Warn().Msg("Some rows are still mismatched after retry 2 times, stopping retry process.")
+			log.Warn("Some rows are still mismatched after retry 2 times, stopping retry process.")
 			AbnormalCancel(cancelFunc, normalCancelFlag)
 			return
 		}
 		enqueueErr := cv.RetryQueue.Enqueue(newRetryRowMap)
 		if enqueueErr != nil {
-			log.Error().Err(enqueueErr).
-				Int("row_count", len(newRetryRowMap)).
-				Msg("Failed to re-enqueue rows for retry")
+			log.WithField("row_count", len(newRetryRowMap)).WithError(enqueueErr).
+				Error("Failed to re-enqueue rows for retry")
 			AbnormalCancel(cancelFunc, normalCancelFlag)
 		}
 	} else if checksumErr == nil { // Only log success if there wasn't a calculation error
-		log.Info().Int("checked_count", len(retryRowMap)).
-			Msg("Successfully retried and verified rows, no mismatches found in this batch.")
+		log.WithField("checked_count", len(retryRowMap)).
+			Info("Successfully retried and verified rows, no mismatches found in this batch.")
 	}
 }
 

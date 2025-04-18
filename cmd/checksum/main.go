@@ -8,14 +8,13 @@ import (
 	"github.com/arnkore/rds-checksum/pkg/metadata"
 	"github.com/arnkore/rds-checksum/pkg/storage" // Assuming storage package exists
 	"github.com/jessevdk/go-flags"
-	"io"
 	"os"
 	"sync/atomic"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql" // Assuming MySQL for results DB
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
+	log "github.com/sirupsen/logrus"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 var (
@@ -58,16 +57,17 @@ func main() {
 	dbStore := setUpStorage(opts)
 
 	// --- Create and run the checksum ---
-	log.Info().Str("source_ip", opts.SourceHost).
-		Int("source_port", opts.SourcePort).
-		Str("source_db", opts.SourceDB).
-		Str("target_ip", opts.TargetHost).
-		Int("target_port", opts.TargetPort).
-		Str("target_db", opts.TargetDB).
-		Str("table", opts.TableName).
-		Int("batch_size", opts.RowsPerBatch).
-		Int("concurrency", opts.ConcurrentLimit).
-		Msg("Starting checksum validation")
+	log.WithFields(log.Fields{
+		"source_ip":   opts.SourceHost,
+		"source_port": opts.SourcePort,
+		"source_db":   opts.SourceDB,
+		"target_ip":   opts.TargetHost,
+		"target_port": opts.TargetPort,
+		"target_db":   opts.TargetDB,
+		"table":       opts.TableName,
+		"batch_size":  opts.RowsPerBatch,
+		"concurrency": opts.ConcurrentLimit,
+	}).Info("Starting checksum validation")
 	srcConfig := metadata.NewConfig(opts.SourceHost, opts.SourcePort, opts.SourceUser, opts.SourcePassword, opts.SourceDB)
 	targetConfig := metadata.NewConfig(opts.TargetHost, opts.TargetPort, opts.TargetUser, opts.TargetPassword, opts.TargetDB)
 	validator := checksum.NewChecksumValidator(srcConfig, targetConfig, opts.TableName, opts.RowsPerBatch, opts.ConcurrentLimit, opts.CalcCrc32InDB, dbStore)
@@ -83,7 +83,7 @@ func main() {
 	jobID := validator.GetJobID()
 
 	if runErr != nil {
-		log.Error().Err(runErr).Int64(common.JOB_ID_KEY, jobID).Msg("Validation job run failed and potentially incomplete")
+		log.WithError(runErr).WithField(common.JOB_ID_KEY, jobID).Error("Validation job run failed and potentially incomplete")
 		// FIXME 有报错，要尝试重试，而不是直接退出程序。
 		os.Exit(1)
 	}
@@ -97,9 +97,9 @@ func main() {
 		select {
 		case <-ctx.Done():
 			if normalCancelFlag.Load() {
-				log.Info().Int64(common.JOB_ID_KEY, jobID).Msg("✅ Result: Checksums match.")
+				log.WithField(common.JOB_ID_KEY, jobID).Info("✅ Result: Checksums match.")
 			} else {
-				log.Warn().Int64(common.JOB_ID_KEY, jobID).Msg("❌ Result: Checksums DO NOT match.")
+				log.WithField(common.JOB_ID_KEY, jobID).Warn("❌ Result: Checksums DO NOT match.")
 			}
 			return
 		}
@@ -118,26 +118,56 @@ func processFlags() *Options {
 	return &opts
 }
 
-func setupLogger(logFile string) {
-	var logWriter io.Writer = zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339Nano} // Default to pretty stderr
-	if logFile != "" {
-		logF, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
-		if err != nil {
-			log.Fatal().Err(err).Str("file", logFile).Msg("Error opening log file")
-		}
-		// 配置 ConsoleWriter 输出到文件
-		fileWriter := zerolog.ConsoleWriter{
-			Out:        logF,
-			TimeFormat: time.RFC3339Nano, // 带毫秒的时间格式
-			NoColor:    true,             // 禁用颜色（文件不需要）
-		}
-		// Use MultiWriter to write to both file (plain JSON) and console (pretty)
-		logWriter = zerolog.MultiLevelWriter(logWriter, fileWriter)
+func setupLogger(logFilePath string) {
+	// 创建 Logrus 实例
+	logger := log.New()
+	// 设置日志级别（生产环境建议 Info 或 Warn）
+	logger.SetLevel(log.InfoLevel)
+	// 设置日志格式
+	logger.SetFormatter(&log.TextFormatter{
+		FullTimestamp:   true,                      // 显示完整时间戳
+		TimestampFormat: "2006-01-02 15:04:05.000", // 标准时间格式
+		ForceColors:     false,                     // 生产环境禁用颜色（控制台）
+		DisableQuote:    true,                      // 避免字段值被引号包裹
+		PadLevelText:    true,                      // 统一日志级别宽度
+	})
+
+	// 设置日志备份&滚动策略
+	logFile := &lumberjack.Logger{
+		Filename:   logFilePath, // 日志文件路径
+		MaxSize:    100,         // 单个日志文件最大 100MB
+		MaxBackups: 10,          // 保留最近 5 个备份
+		MaxAge:     30,          // 保留 30 天的日志
+		Compress:   true,        // 压缩旧日志
 	}
 
-	zerolog.TimeFieldFormat = "2006-01-02 15:04:05.000"
-	zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	log.Logger = zerolog.New(logWriter).With().Timestamp().Logger() // Set as global logger
+	// 多输出：同时写入文件和控制台
+	logger.SetOutput(os.Stdout)                 // 控制台输出
+	logger.AddHook(&fileHook{logFile: logFile}) // 文件输出钩子
+
+	// 添加全局字段（上下文信息）
+	logger.WithFields(log.Fields{
+		"app":     "rds-checksum",
+		"version": "1.0.0",
+	}).Info("Logrus logger initialized")
+}
+
+// 自定义 Hook 用于文件输出
+type fileHook struct {
+	logFile *lumberjack.Logger
+}
+
+func (h *fileHook) Levels() []log.Level {
+	return log.AllLevels
+}
+
+func (h *fileHook) Fire(entry *log.Entry) error {
+	line, err := entry.String()
+	if err != nil {
+		return err
+	}
+	_, err = h.logFile.Write([]byte(line))
+	return err
 }
 
 func setUpStorage(opts *Options) *storage.Store {
@@ -150,7 +180,7 @@ func setUpStorage(opts *Options) *storage.Store {
 	})
 	resultsDB, err := resultDbConnProvider.CreateDbConn()
 	if err != nil {
-		log.Error().Err(err).Msg("Error connecting to metadata database")
+		log.WithError(err).Error("Error connecting to metadata database")
 		os.Exit(1)
 	}
 	dbStore := storage.NewStore(resultsDB)
@@ -184,7 +214,7 @@ func getSrcTableInfo(validator *checksum.ChecksumValidator) *metadata.TableInfo 
 	for i := 0; i < GET_TABLE_INFO_MAX_RETRY_TIMES; i++ {
 		srcTableInfo, err = validator.GetSrcTableMetaProvider().QueryTableInfo(validator.TableName)
 		if err != nil {
-			log.Error().Err(err).Str("table", validator.TableName).Msg("Failed to get source table info")
+			log.WithError(err).WithField("table", validator.TableName).Error("Failed to get source table info")
 			if i == GET_TABLE_INFO_MAX_RETRY_TIMES-1 {
 				return nil
 			}
