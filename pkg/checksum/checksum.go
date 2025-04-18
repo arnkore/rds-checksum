@@ -1,6 +1,8 @@
 package checksum
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"github.com/arnkore/rds-checksum/pkg/common"
 	"github.com/arnkore/rds-checksum/pkg/metadata"
@@ -126,7 +128,7 @@ func (cv *ChecksumValidator) updateJobStatus(comparisonResult *CompareChecksumRe
 		Int64("target_rows", tgtRows).
 		Int("mismatched_batches", mismatchedCount).
 		Str("error_message", errMsg).
-		Msg("Attempting to update job completion status")
+		Msg("Attempting to update job status")
 	// Convert enum back to string for the database layer
 	err := cv.DbStore.UpdateJobCompletion(cv.JobID, string(status), matchStatus, srcRows, tgtRows, mismatchedCount, errMsg)
 	if err != nil {
@@ -418,22 +420,73 @@ func (cv *ChecksumValidator) Run() (finalResult *CompareChecksumResults, finalEr
 	return finalResult, finalError
 }
 
-func (cv *ChecksumValidator) RetryChecksum() {
+func (cv *ChecksumValidator) RetryChecksum(cancel context.CancelFunc, firstRunChecksumFinished *atomic.Bool) {
+	firstRunFinished := firstRunChecksumFinished.Load()
 	_retryRowMap, err := cv.RetryQueue.Dequeue()
 	if err != nil {
-
+		if isQueueEmpty(err) {
+			if firstRunFinished {
+				log.Info().Msg("Retry_queue is empty and first run finished, stopping retry process.")
+				cancel()
+			}
+			return
+		} else if cv.RetryQueue.IsLocked() {
+			log.Error().Err(err).Msg("Queue is locked, stopping retry process.")
+			cancel()
+		}
 	}
-	retryRowMap := _retryRowMap.(map[int64]*RetryCheckRow)
 
+	retryRowMap, ok := _retryRowMap.(map[int64]*RetryCheckRow)
+	if !ok {
+		log.Error().Interface("dequeued_item", _retryRowMap).
+			Msg("Dequeued item is not of expected type map[int64]*RetryCheckRow")
+		return // Skip processing invalid item
+	}
+
+	log.Info().Int("retry_rows_count", len(retryRowMap)).Msg("Dequeued rows for retry check")
 	// TODO 待重试的batch中失败的row可能比较少，尝试合并之
-
 	// FIXME checksum中间发生了DDL，需要直接失败，怎么检测呢？
+
 	srcTableInfo, err := cv.SrcTableMetaProvider.QueryTableInfo(cv.TableName)
-	rowChecksum := NewRowChecksum(retryRowMap, srcTableInfo, cv.SrcConnProvider, cv.TargetConnProvider, cv.CalcCRC32InDB)
-	newRetryRowMap, err := rowChecksum.CalculateAndCompareChecksum(srcTableInfo.Columns)
-	if len(newRetryRowMap) != 0 {
-		cv.RetryQueue.Enqueue(newRetryRowMap)
+	if err != nil { // Added error handling and log
+		log.Error().Err(err).Str("table", cv.TableName).Msg("Failed to get source table info during retry")
+		// FIXME 达到最大重试次数，退出queue
+		return
 	}
+
+	rowChecksum := NewRowChecksum(retryRowMap, srcTableInfo, cv.SrcConnProvider, cv.TargetConnProvider, cv.CalcCRC32InDB)
+	newRetryRowMap, checksumErr := rowChecksum.CalculateAndCompareChecksum(srcTableInfo.Columns)
+	if checksumErr != nil {
+		log.Error().Err(checksumErr).
+			Int("initial_row_count", len(retryRowMap)).
+			Msg("Error during row checksum calculation/comparison")
+	}
+
+	if len(newRetryRowMap) > 0 {
+		log.Warn().Int("new_retry_count", len(newRetryRowMap)).
+			Int("original_count", len(retryRowMap)).
+			Msg("Some rows still mismatched after retry, re-enqueuing")
+		enqueueErr := cv.RetryQueue.Enqueue(newRetryRowMap)
+		if enqueueErr != nil {
+			log.Error().Err(enqueueErr).
+				Int("row_count", len(newRetryRowMap)).
+				Msg("Failed to re-enqueue rows for retry")
+		}
+	} else if checksumErr == nil { // Only log success if there wasn't a calculation error
+		log.Info().Int("checked_count", len(retryRowMap)).
+			Msg("Successfully retried and verified rows, no mismatches found in this batch.")
+	}
+}
+
+func isQueueEmpty(err error) bool {
+	if err != nil {
+		var queryErr *goconcurrentqueue.QueueError
+		if errors.As(err, &queryErr) && queryErr.Code() == goconcurrentqueue.QueueErrorCodeEmptyQueue {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Helper function to compare string slices

@@ -9,6 +9,7 @@ import (
 	"github.com/jessevdk/go-flags"
 	"io"
 	"os"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql" // Assuming MySQL for results DB
@@ -44,30 +45,12 @@ type Options struct {
 }
 
 func main() {
-	// 使用 context 控制取消
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	// --- Processing flags ---
 	opts := processFlags()
-
 	// --- Setup Logger ---
 	setupLogger(opts.LogFile)
-
 	// --- Connect to Results DB ---
-	resultDbConnProvider := metadata.NewDBConnProvider(&metadata.Config{
-		Host:     opts.ResultHost,
-		Port:     opts.ResultPort,
-		User:     opts.ResultUser,
-		Password: opts.ResultPassword,
-		Database: opts.ResultDB,
-	})
-	resultsDB, err := resultDbConnProvider.CreateDbConn()
-	if err != nil {
-		log.Error().Err(err).Msg("Error connecting to metadata database")
-		os.Exit(1)
-	}
-	dbStore := storage.NewStore(resultsDB)
+	dbStore := setUpStorage(opts)
 
 	// --- Create and run the checksum ---
 	log.Info().Str("source_ip", opts.SourceHost).
@@ -83,15 +66,21 @@ func main() {
 	srcConfig := metadata.NewConfig(opts.SourceHost, opts.SourcePort, opts.SourceUser, opts.SourcePassword, opts.SourceDB)
 	targetConfig := metadata.NewConfig(opts.TargetHost, opts.TargetPort, opts.TargetUser, opts.TargetPassword, opts.TargetDB)
 	validator := checksum.NewChecksumValidator(srcConfig, targetConfig, opts.TableName, opts.RowsPerBatch, opts.ConcurrentLimit, opts.CalcCrc32InDB, dbStore)
-	go setRetryTask(ctx, validator)
-	result, runErr := validator.Run()
 
+	// 非重试的checksum task是否运行结束
+	var firstRunChecksumFinished = &atomic.Bool{}
+	// 使用 context 控制取消
+	ctx, cancel := context.WithCancel(context.Background())
+	go setupChecksumRetryTask(ctx, cancel, validator, firstRunChecksumFinished)
+	result, runErr := validator.Run()
 	// --- Handle Results ---
 	jobID := validator.GetJobID() // Assume validator exposes the job ID it created
+	firstRunChecksumFinished.Store(true)
 
 	if runErr != nil {
 		// Error occurred *during* validation run (potentially after job created)
 		log.Error().Err(runErr).Int64("job_id", jobID).Msg("Validation job run failed and potentially incomplete")
+		// FIXME 有报错，要尝试重试，而不是直接退出程序。
 		os.Exit(1)
 	}
 
@@ -99,24 +88,11 @@ func main() {
 	// Results are stored in DB, provide summary log
 	if result.Match {
 		log.Info().Int64("job_id", jobID).Msg("✅ Result: Checksums match.")
-	} else {
-		log.Warn().Int64("job_id", jobID).Msg("❌ Result: Checksums DO NOT match.")
 	}
-	os.Exit(0)
-}
-
-func setRetryTask(ctx context.Context, validator *checksum.ChecksumValidator) {
-	// 每秒触发一次
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop() // 确保停止 ticker，防止资源泄漏
 
 	for {
 		select {
-		case <-ticker.C:
-			fmt.Println("执行重试任务:", time.Now())
-			validator.RetryChecksum()
 		case <-ctx.Done():
-			fmt.Println("任务停止")
 			return
 		}
 	}
@@ -152,5 +128,39 @@ func setupLogger(logFile string) {
 	}
 
 	zerolog.TimeFieldFormat = "2006-01-02 15:04:05.000"
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	log.Logger = zerolog.New(consoleWriter).With().Timestamp().Logger() // Set as global logger
+}
+
+func setUpStorage(opts *Options) *storage.Store {
+	resultDbConnProvider := metadata.NewDBConnProvider(&metadata.Config{
+		Host:     opts.ResultHost,
+		Port:     opts.ResultPort,
+		User:     opts.ResultUser,
+		Password: opts.ResultPassword,
+		Database: opts.ResultDB,
+	})
+	resultsDB, err := resultDbConnProvider.CreateDbConn()
+	if err != nil {
+		log.Error().Err(err).Msg("Error connecting to metadata database")
+		os.Exit(1)
+	}
+	dbStore := storage.NewStore(resultsDB)
+	return dbStore
+}
+
+func setupChecksumRetryTask(ctx context.Context, cancel context.CancelFunc, validator *checksum.ChecksumValidator,
+	firstRunChecksumFinished *atomic.Bool) {
+	// 每3秒触发一次
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop() // 确保停止 ticker，防止资源泄漏
+
+	for {
+		select {
+		case <-ticker.C:
+			validator.RetryChecksum(cancel, firstRunChecksumFinished)
+		case <-ctx.Done():
+			return
+		}
+	}
 }
