@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/arnkore/rds-checksum/pkg/batch"
 	"github.com/arnkore/rds-checksum/pkg/common"
 	"github.com/arnkore/rds-checksum/pkg/metadata"
 	"github.com/arnkore/rds-checksum/pkg/storage" // Added storage import
@@ -187,7 +188,7 @@ func (cv *ChecksumValidator) setupMetadata() (*metadata.TableInfo, *metadata.Tab
 
 // calculateBatches determines the batches for checksum based on source table info.
 func (cv *ChecksumValidator) calculateBatches(srcInfo *metadata.TableInfo) ([]metadata.Batch, error) {
-	batchCalculator := NewBatchCalculator(srcInfo, cv.RowsPerBatch)
+	batchCalculator := batch.NewBatchCalculator(srcInfo, cv.RowsPerBatch)
 	batches, err := batchCalculator.CalculateBatches()
 	if err != nil {
 		return nil, fmt.Errorf("failed to calculate batches: %w", err)
